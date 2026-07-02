@@ -14,7 +14,7 @@ import {
     PostingDirection,
     RawCell,
     RawRow,
-} from './model';
+} from '../shared/models';
 
 /**
  * Normalises a header cell for matching: lowercase, and strip whitespace, the

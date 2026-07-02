@@ -18,100 +18,6 @@ export interface User extends BaseDocument {
     active: boolean;
 }
 
-// ---------- Clients (WT-3, WT-11) ----------
-
-export type ClientType = 'advisory' | 'accounting';
-export type RecurrenceInterval = 'monthly' | 'quarterly' | 'annually';
-
-export interface Client extends BaseDocument {
-    name: string;
-    type: ClientType;
-    /** Recurring (accounting) clients only. */
-    recurrence?: RecurrenceInterval;
-    /** Staff user ids allocated to this client — drives staff dashboard scoping. */
-    allocatedUserIds: string[];
-}
-
-// ---------- Engagement templates (WT-6, WT-13) ----------
-
-export interface TaskDefinition {
-    name: string;
-    /** Position in the sequential chain (blocker system, WT-8). */
-    order: number;
-    /** Accounting: "due by Day N of the month" — actual dates auto-calculated. */
-    relativeDueDay?: number;
-    /** Advisory: due date offset in days from project start. */
-    durationDays?: number;
-    escalationOffsetDays?: number;
-    escalationContacts?: string[];
-    /** Manager-approved parallel step: doesn't wait for the previous task (WT-9). */
-    allowParallelWithPrevious?: boolean;
-}
-
-export interface EngagementTemplate extends BaseDocument {
-    name: string;
-    type: ClientType;
-    tasks: TaskDefinition[];
-}
-
-// ---------- Projects / engagements (WT-10, WT-12) ----------
-
-export type ProjectStatus = 'active' | 'closed';
-
-export interface Project extends BaseDocument {
-    name: string;
-    clientId: string;
-    type: ClientType;
-    templateId?: string;
-    /** Accounting cycle this run covers, e.g. '2026-06'. */
-    period?: string;
-    status: ProjectStatus;
-    startDate?: string;
-    endDate?: string;
-    /** Closing locks the project to preserve the historical timeline. */
-    closedAt?: string;
-    closedBy?: string;
-}
-
-// ---------- Tasks (WT-7, WT-8, WT-16, WT-18) ----------
-
-export type TaskStatus = 'not_started' | 'in_progress' | 'completed';
-
-export interface WorkflowTask extends BaseDocument {
-    name: string;
-    projectId?: string;
-    clientId?: string;
-    /** Entity/client display name shown on the task receipt. */
-    clientEntity: string;
-    assignedTo: string;
-    /** Who sent/uploaded the task. */
-    submittedBy: string;
-    /** Position in the project's sequential chain. */
-    order?: number;
-    startDate?: string;
-    dueDate: string;
-    status: TaskStatus;
-    escalationDate?: string;
-    escalationContacts?: string[];
-    /** Manager override allowing this task to start in parallel (WT-9). */
-    parallelAllowed?: boolean;
-    /** Single sign-off: timestamped completion (WT-16). */
-    signedOffAt?: string;
-    signedOffBy?: string;
-}
-
-// ---------- Comments & progress updates (WT-17, WT-19) ----------
-
-export type CommentKind = 'comment' | 'progress';
-
-export interface TaskComment extends BaseDocument {
-    taskId: string;
-    projectId?: string;
-    author: string;
-    text: string;
-    kind: CommentKind;
-}
-
 // ---------- Audit trail (WT-33) ----------
 
 export interface AuditLogEntry extends BaseDocument {
@@ -123,23 +29,131 @@ export interface AuditLogEntry extends BaseDocument {
     details?: Record<string, unknown>;
 }
 
-// ---------- Notifications / escalation matrix (WT-25…WT-30) ----------
 
-export type NotificationKind =
-    | 'nudge_t_minus_2'
-    | 'amber_deadline'
-    | 'red_t_plus_1'
-    | 'critical_t_plus_3'
-    | 'sign_off'
-    | 'daily_summary';
 
-export type NotificationStatus = 'pending' | 'sent' | 'failed';
+/**
+ * LG / Manager's-Cheque GL reconciliation — domain model (GOAL.md §2, §4 F2).
+ *
+ * The input is a raw GL "transaction breakdown" for a suspense/clearing account
+ * (e.g. the SWIFT inter-system account behind Letters of Guarantee and Manager's
+ * Cheques). Each spreadsheet row is a single GL posting. We normalise those rows
+ * into `LedgerPosting`s that the matching / reconciliation engine (later slices)
+ * can work with.
+ *
+ * Money: the sample data is BHD, which has 3 decimal places (fils). We keep every
+ * amount as an integer number of **fils** so arithmetic never touches floats
+ * (GOAL.md §6). `amountBhd` is a convenience decimal for display only.
+ */
 
-export interface NotificationRecord extends BaseDocument {
-    kind: NotificationKind;
-    recipient: string;
-    taskId?: string;
-    projectId?: string;
-    status: NotificationStatus;
-    sentAt?: string;
+/** A single raw cell as produced by the xlsx/csv reader. */
+export type RawCell = string | number | boolean | Date | null | undefined;
+
+/** A raw row: header row is row 0, data rows follow. Cells are 0-indexed. */
+export type RawRow = RawCell[];
+
+/** Debit = money out of the account (positive amount); credit = money in (negative). */
+export type PostingDirection = 'debit' | 'credit';
+
+/** The canonical fields we extract from the breakdown. Mapped from headers by alias. */
+export type CanonicalField =
+    | 'entity'
+    | 'branchNumber'
+    | 'sbu'
+    | 'level6'
+    | 'level3'
+    | 'level0'
+    | 'glDesc'
+    | 'glName'
+    | 'gl'
+    | 'accountNumber'
+    | 'postDate'
+    | 'postTime'
+    | 'valueDate'
+    | 'source'
+    | 'logDescription'
+    | 'currency'
+    | 'amountFcy'
+    | 'amountLcy'
+    | 'amountBhd'
+    | 'journalNumber'
+    | 'sequence'
+    | 'userId'
+    | 'username';
+
+/** A normalised GL posting. `amount*Fils` are signed integer fils (positive = debit). */
+export interface LedgerPosting {
+    entity: string;
+    branchNumber: string;
+    sbu?: string;
+    level6?: string;
+    level3?: string;
+    level0?: string;
+    glDesc?: string;
+    glName?: string;
+    gl: string;
+    accountNumber?: string;
+    /** ISO date (yyyy-mm-dd). */
+    postDate: string;
+    /** Raw time string as supplied, e.g. '06:53:19.46'. */
+    postTime?: string;
+    valueDate?: string;
+    source?: string;
+    logDescription: string;
+    /** Leading 6-digit posting-type code parsed from logDescription, e.g. '020050'. */
+    logCode?: string;
+    currency: string;
+    amountFcyFils?: number;
+    amountLcyFils?: number;
+    /** The reconciling amount, in signed integer fils (positive = debit, negative = credit). */
+    amountBhdFils: number;
+    /** Convenience decimal (amountBhdFils / 1000) — for display only, never for maths. */
+    amountBhd: number;
+    direction: PostingDirection;
+    journalNumber: string;
+    sequence?: string;
+    userId?: string;
+    username?: string;
+    /** 1-based source row number (data rows only, header excluded) for traceability. */
+    rowNumber: number;
+}
+
+/** Codes used on parse errors/warnings so callers/tests can assert precisely. */
+export type ParseErrorCode =
+    | 'MISSING_HEADER'
+    | 'EMPTY_INPUT'
+    | 'MISSING_FIELD'
+    | 'BAD_AMOUNT'
+    | 'BAD_DATE'
+    | 'ZERO_AMOUNT';
+
+export interface ParseError {
+    code: ParseErrorCode;
+    message: string;
+    /** 1-based data-row number; omitted for file/header-level problems. */
+    row?: number;
+    field?: CanonicalField;
+}
+
+export interface ParseSummary {
+    dataRows: number;
+    parsed: number;
+    debitCount: number;
+    creditCount: number;
+    /** Sum of signed amountBhdFils across parsed postings (≈0 ⇒ debits balance credits). */
+    netFils: number;
+    currencies: string[];
+    branches: string[];
+}
+
+export interface ParseResult {
+    postings: LedgerPosting[];
+    errors: ParseError[];
+    summary: ParseSummary;
+}
+
+/** BHD (and the sample data) use 3 decimal places. */
+export const AMOUNT_SCALE = 1000;
+
+export function filsToBhd(fils: number): number {
+    return fils / AMOUNT_SCALE;
 }
