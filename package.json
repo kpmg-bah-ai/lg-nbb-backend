@@ -14,7 +14,8 @@
     },
     "dependencies": {
         "@azure/cosmos": "^4.9.3",
-        "@azure/functions": "^4.5.0"
+        "@azure/functions": "^4.5.0",
+        "exceljs": "^4.4.0"
     },
     "devDependencies": {
         "@types/jest": "^30.0.0",
