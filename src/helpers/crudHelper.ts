@@ -1,6 +1,5 @@
-import { Container, SqlParameter, SqlQuerySpec } from '@azure/cosmos';
 import { randomUUID } from 'node:crypto';
-
+import { Container, SqlParameter, SqlQuerySpec } from '@azure/cosmos';
 import { getContainer } from '../data/cosmos';
 
 export interface BaseDocument {
@@ -93,7 +92,11 @@ export class CrudHelper<T extends BaseDocument> {
     }
 
     /** Shallow-merges changes into the stored document. Returns undefined if it doesn't exist. */
-    async update(id: string, changes: Partial<Omit<T, keyof BaseDocument>>, partitionKey?: string): Promise<T | undefined> {
+    async update(
+        id: string,
+        changes: Partial<Omit<T, keyof BaseDocument>>,
+        partitionKey?: string
+    ): Promise<T | undefined> {
         const existing = await this.get(id, partitionKey);
         if (!existing) {
             return undefined;
@@ -102,7 +105,9 @@ export class CrudHelper<T extends BaseDocument> {
         const container = await this.container();
         const { resource } = await container
             .item(id, partitionKey ?? this.getPartitionKey(existing))
-            .replace<T>(updated, { accessCondition: { type: 'IfMatch', condition: (existing as { _etag?: string })._etag } });
+            .replace<T>(updated, {
+                accessCondition: { type: 'IfMatch', condition: (existing as { _etag?: string })._etag },
+            });
         return resource as T;
     }
 

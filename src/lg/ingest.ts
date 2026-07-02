@@ -10,8 +10,7 @@
  */
 
 import * as ExcelJS from 'exceljs';
-
-import { ParseResult, RawCell, RawRow } from './model';
+import { ParseResult, RawCell, RawRow } from '../shared/models';
 import { parseRows } from './parse';
 
 export type IngestFormat = 'xlsx' | 'csv';

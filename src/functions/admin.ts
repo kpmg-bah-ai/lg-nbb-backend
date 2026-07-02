@@ -1,5 +1,4 @@
 import { app } from '@azure/functions';
-
 import { getContainer } from '../data/cosmos';
 import { CONTAINER_IDS, notifications, users } from '../data/repositories';
 import { recordAudit } from '../helpers/audit';
@@ -48,7 +47,9 @@ app.http('admin-bootstrap-user', {
         if (!['admin', 'manager', 'staff'].includes(body.role)) {
             return badRequest('role must be admin, manager or staff');
         }
-        const existing = await users.count('LOWER(c.email) = @email', [{ name: '@email', value: body.email.toLowerCase() }]);
+        const existing = await users.count('LOWER(c.email) = @email', [
+            { name: '@email', value: body.email.toLowerCase() },
+        ]);
         if (existing > 0) {
             return error(409, 'A user with this email already exists');
         }

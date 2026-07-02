@@ -22,7 +22,7 @@ function getClient(): CosmosClient {
  */
 export function getContainer(containerId: string, partitionKeyPath = '/id'): Promise<Container> {
     let cached = containerCache.get(containerId);
-    if (!cached) {
+    if (cached === undefined) {
         cached = (async () => {
             const { database } = await getClient().databases.createIfNotExists({ id: DATABASE_ID });
             const { container } = await database.containers.createIfNotExists({

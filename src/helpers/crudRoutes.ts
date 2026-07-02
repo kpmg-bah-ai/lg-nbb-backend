@@ -1,6 +1,5 @@
 import { SqlQuerySpec } from '@azure/cosmos';
 import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
-
 import { Role, User } from '../shared/models';
 import { requireRole } from './auth';
 import { BaseDocument, CrudHelper } from './crudHelper';

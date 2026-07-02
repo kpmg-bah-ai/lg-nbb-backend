@@ -8,7 +8,7 @@ import {
     AMOUNT_SCALE,
     CanonicalField,
     filsToBhd,
-    LedgerPosting,
+    ParsedPosting,
     ParseError,
     ParseResult,
     PostingDirection,
@@ -88,7 +88,11 @@ export function mapHeaders(headerRow: RawRow): HeaderResult {
     const errors: ParseError[] = [];
     for (const field of REQUIRED_FIELDS) {
         if (columns[field] === undefined) {
-            errors.push({ code: 'MISSING_HEADER', field, message: `Required column "${field}" was not found in the header row` });
+            errors.push({
+                code: 'MISSING_HEADER',
+                field,
+                message: `Required column "${field}" was not found in the header row`,
+            });
         }
     }
     return { columns, errors };
@@ -161,7 +165,9 @@ export function coerceDate(value: RawCell): string | undefined {
 
 /** Extracts the leading 6-digit posting-type code from a log description. */
 export function extractLogCode(logDescription: RawCell): string | undefined {
-    const m = String(logDescription ?? '').trim().match(/^(\d{6})/);
+    const m = String(logDescription ?? '')
+        .trim()
+        .match(/^(\d{6})/);
     return m ? m[1] : undefined;
 }
 
@@ -195,7 +201,7 @@ function str(value: RawCell): string | undefined {
 }
 
 export interface RowResult {
-    posting?: LedgerPosting;
+    posting?: ParsedPosting;
     errors: ParseError[];
 }
 
@@ -215,12 +221,22 @@ export function normalizeRow(row: RawRow, columns: ColumnIndex, rowNumber: numbe
 
     const postDate = coerceDate(cell('postDate'));
     if (postDate === undefined) {
-        errors.push({ code: 'BAD_DATE', field: 'postDate', row: rowNumber, message: 'Post Date is missing or not a valid date' });
+        errors.push({
+            code: 'BAD_DATE',
+            field: 'postDate',
+            row: rowNumber,
+            message: 'Post Date is missing or not a valid date',
+        });
     }
 
     const amountBhdFils = parseAmountToFils(cell('amountBhd'));
     if (amountBhdFils === undefined) {
-        errors.push({ code: 'BAD_AMOUNT', field: 'amountBhd', row: rowNumber, message: 'Amount (BHD) is missing or not a number' });
+        errors.push({
+            code: 'BAD_AMOUNT',
+            field: 'amountBhd',
+            row: rowNumber,
+            message: 'Amount (BHD) is missing or not a number',
+        });
     }
 
     for (const [field, value] of [
@@ -230,21 +246,40 @@ export function normalizeRow(row: RawRow, columns: ColumnIndex, rowNumber: numbe
         ['currency', currency],
     ] as [CanonicalField, string | undefined][]) {
         if (value === undefined) {
-            errors.push({ code: 'MISSING_FIELD', field, row: rowNumber, message: `Required value "${field}" is empty` });
+            errors.push({
+                code: 'MISSING_FIELD',
+                field,
+                row: rowNumber,
+                message: `Required value "${field}" is empty`,
+            });
         }
     }
 
     const logCode = extractLogCode(logDescription);
     const direction = amountBhdFils === undefined ? undefined : deriveDirection(amountBhdFils, logCode);
     if (amountBhdFils !== undefined && direction === undefined) {
-        errors.push({ code: 'ZERO_AMOUNT', field: 'amountBhd', row: rowNumber, message: 'Amount is zero with no directional log code; cannot classify as debit or credit' });
+        errors.push({
+            code: 'ZERO_AMOUNT',
+            field: 'amountBhd',
+            row: rowNumber,
+            message: 'Amount is zero with no directional log code; cannot classify as debit or credit',
+        });
     }
 
-    if (errors.length > 0 || amountBhdFils === undefined || direction === undefined || !branchNumber || !gl || !journalNumber || !currency || !postDate) {
+    if (
+        errors.length > 0 ||
+        amountBhdFils === undefined ||
+        direction === undefined ||
+        !branchNumber ||
+        !gl ||
+        !journalNumber ||
+        !currency ||
+        !postDate
+    ) {
         return { errors };
     }
 
-    const posting: LedgerPosting = {
+    const posting: ParsedPosting = {
         entity: str(cell('entity')) ?? '',
         branchNumber,
         sbu: str(cell('sbu')),
@@ -300,7 +335,7 @@ export function parseRows(rows: RawRow[]): ParseResult {
         return { ...empty, errors: header.errors };
     }
 
-    const postings: LedgerPosting[] = [];
+    const postings: ParsedPosting[] = [];
     const errors: ParseError[] = [];
     let dataRows = 0;
     let debitCount = 0;

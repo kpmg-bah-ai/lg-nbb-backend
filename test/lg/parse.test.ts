@@ -1,4 +1,4 @@
-import { RawRow } from '../../src/lg/model';
+import { RawRow } from '../../src/shared/models';
 import {
     coerceDate,
     deriveDirection,

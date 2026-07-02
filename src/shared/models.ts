@@ -18,6 +18,28 @@ export interface User extends BaseDocument {
     active: boolean;
 }
 
+// ---------- Workflow tasks (WT-13, WT-21) ----------
+
+export type TaskStatus = 'not_started' | 'in_progress' | 'completed';
+
+/** A template task inside a project workflow; due dates resolve via helpers/dates.ts (WT-13). */
+export interface TaskDefinition {
+    name: string;
+    order: number;
+    /** "Day N of the month" for accounting-period tasks. */
+    relativeDueDay?: number;
+    /** Day offset from the project start date for advisory tasks. */
+    durationDays?: number;
+}
+
+/** A concrete task instance; RAG health derives from status + dueDate (helpers/rag.ts, WT-21). */
+export interface WorkflowTask extends BaseDocument {
+    name: string;
+    status: TaskStatus;
+    dueDate?: string;
+    assignedTo?: string;
+}
+
 // ---------- Audit trail (WT-33) ----------
 
 export interface AuditLogEntry extends BaseDocument {
@@ -29,7 +51,14 @@ export interface AuditLogEntry extends BaseDocument {
     details?: Record<string, unknown>;
 }
 
+// ---------- Notifications ----------
 
+/** Queued outbound notification. Only `status` is contracted so far (admin health counts pending). */
+export interface AppNotification extends BaseDocument {
+    status: 'pending' | 'sent' | 'failed';
+    recipient?: string;
+    details?: Record<string, unknown>;
+}
 
 /**
  * LG / Manager's-Cheque GL reconciliation — domain model (GOAL.md §2, §4 F2).
@@ -81,7 +110,7 @@ export type CanonicalField =
     | 'username';
 
 /** A normalised GL posting. `amount*Fils` are signed integer fils (positive = debit). */
-export interface LedgerPosting {
+export interface LedgerPosting extends BaseDocument {
     entity: string;
     branchNumber: string;
     sbu?: string;
@@ -117,6 +146,12 @@ export interface LedgerPosting {
     rowNumber: number;
 }
 
+/**
+ * A posting as parsed from the file: no storage identity yet. `id`/timestamps are
+ * assigned by CrudHelper if/when a later slice persists postings as LedgerPosting docs.
+ */
+export type ParsedPosting = Omit<LedgerPosting, keyof BaseDocument>;
+
 /** Codes used on parse errors/warnings so callers/tests can assert precisely. */
 export type ParseErrorCode =
     | 'MISSING_HEADER'
@@ -126,6 +161,8 @@ export type ParseErrorCode =
     | 'BAD_DATE'
     | 'ZERO_AMOUNT';
 
+// ParseError/ParseSummary/ParseResult are value objects embedded in an LgRun (or held
+// in memory) — they are never stored as standalone documents, so no BaseDocument.
 export interface ParseError {
     code: ParseErrorCode;
     message: string;
@@ -146,9 +183,28 @@ export interface ParseSummary {
 }
 
 export interface ParseResult {
-    postings: LedgerPosting[];
+    postings: ParsedPosting[];
     errors: ParseError[];
     summary: ParseSummary;
+}
+
+/**
+ * A persisted reconciliation run (GOAL.md §4 F9): the uploaded breakdown's identity
+ * (hash), parse summary and errors. Matching/reconciliation results (F4/F5) attach to
+ * this document in later slices. Postings are not persisted — they are re-derivable
+ * from the input, and 550k rows would blow Cosmos document limits.
+ */
+export interface LgRun extends BaseDocument {
+    filename?: string;
+    format: 'xlsx' | 'csv';
+    /** SHA-256 of the uploaded bytes — same input ⇒ same hash (GOAL.md §5 determinism). */
+    inputSha256: string;
+    /** User id of the uploader (F9 audit / F10 access control). */
+    uploadedBy: string;
+    summary: ParseSummary;
+    /** Total number of parse errors; `errors` itself is capped when stored. */
+    errorCount: number;
+    errors: ParseError[];
 }
 
 /** BHD (and the sample data) use 3 decimal places. */

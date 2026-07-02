@@ -1,5 +1,4 @@
 import { HttpRequest, HttpResponseInit } from '@azure/functions';
-
 import { users } from '../data/repositories';
 import { Role, User } from '../shared/models';
 import { forbidden, unauthorized } from './json';
