@@ -72,7 +72,8 @@ export class CrudHelper<T extends BaseDocument> {
             continuationToken: options.continuationToken,
         });
         const response = await iterator.fetchNext();
-        return { items: response.resources, continuationToken: response.continuationToken };
+        // A fresh/empty container can yield undefined resources — never leak that shape.
+        return { items: response.resources ?? [], continuationToken: response.continuationToken };
     }
 
     /** Runs an arbitrary SQL query and returns all results (no paging). */

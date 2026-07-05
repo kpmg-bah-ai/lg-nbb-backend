@@ -267,6 +267,43 @@ export interface MatchSummary {
     byBranch: { branchNumber: string; outstandingCount: number; outstandingFils: number }[];
 }
 
+// ---------- F5: reconciliation & Difference ----------
+
+/** One branch's reconciliation block (GOAL.md §2.2): GL Balance vs Σ outstanding. */
+export interface BranchReconciliation {
+    entity: string;
+    gl: string;
+    branchNumber: string;
+    /** F3 balance, signed integer fils. */
+    glBalanceFils: number;
+    /** Σ signed outstanding fils (debits +, credits −). */
+    outstandingNetFils: number;
+    outstandingCount: number;
+    oldCount: number;
+    /** Σ |outstanding| fils of Old Items — the statement's Section A subtotal. */
+    oldFils: number;
+    currentCount: number;
+    /** Σ |outstanding| fils of current (< 1 year) items — Section B subtotal. */
+    currentFils: number;
+    /** glBalanceFils − outstandingNetFils. Never rounded away (GOAL.md §5). */
+    differenceFils: number;
+    /** Display-only decimal of differenceFils. */
+    difference: number;
+    /** |differenceFils| ≤ tolerance. */
+    balanced: boolean;
+}
+
+export interface Reconciliation {
+    asOf?: string;
+    /** GOAL.md §6: balanced ⇔ |difference| ≤ 0.001 BHD, i.e. 1 fil, by default. */
+    toleranceFils: number;
+    /** Every branch balanced. */
+    balanced: boolean;
+    /** Σ |differenceFils| across branches — the headline audit figure. */
+    totalAbsDifferenceFils: number;
+    byBranch: BranchReconciliation[];
+}
+
 /**
  * A persisted reconciliation run (GOAL.md §4 F9): the uploaded breakdown's identity
  * (hash), parse summary and errors, plus the F3 balances and F4 matching results
@@ -295,6 +332,8 @@ export interface LgRun extends BaseDocument {
     matching?: MatchSummary;
     outstandingCount?: number;
     outstanding?: OutstandingItem[];
+    /** F5: per-branch Difference / Balanced status derived from balances + outstanding. */
+    reconciliation?: Reconciliation;
 }
 
 /** BHD (and the sample data) use 3 decimal places. */

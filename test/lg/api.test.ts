@@ -152,6 +152,11 @@ describe('POST lg/runs (F1 upload + F9 persistence + F10 auth)', () => {
         expect(run.matching!.netOutstandingFils).toBe(0);
         expect(run.outstandingCount).toBe(run.matching!.outstandingCount);
         expect(run.outstanding!.length).toBe(run.outstandingCount);
+        // F5: internally-derived balances always tie out — Balanced, Difference 0.
+        expect(run.reconciliation!.balanced).toBe(true);
+        expect(run.reconciliation!.totalAbsDifferenceFils).toBe(0);
+        expect(run.reconciliation!.byBranch.length).toBeGreaterThan(0);
+        expect(run.reconciliation!.byBranch.every((b) => b.differenceFils === 0)).toBe(true);
     });
 
     it('honours an explicit ?asOf= review date', async () => {

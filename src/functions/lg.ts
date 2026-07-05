@@ -21,6 +21,7 @@ import { badRequest, created, error, json, notFound } from '../helpers/json';
 import { computeBranchBalances, deriveAsOf } from '../lg/balance';
 import { detectFormat, ingest } from '../lg/ingest';
 import { matchPostings } from '../lg/match';
+import { reconcile } from '../lg/reconcile';
 
 /** Cosmos documents are capped at 2MB — store only the first errors plus the total count. */
 const MAX_STORED_ERRORS = 100;
@@ -115,6 +116,8 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
     const asOf = asOfParam ?? deriveAsOf(result.postings);
     const balances = computeBranchBalances(result.postings, asOf);
     const match = result.postings.length > 0 ? matchPostings(result.postings, { asOf }) : undefined;
+    // F5: Difference & Balanced per branch, from the full (uncapped) outstanding list.
+    const reconciliation = match ? reconcile(balances, match.outstanding, { asOf }) : undefined;
 
     const inputSha256 = createHash('sha256').update(buffer).digest('hex');
     // Same-input detection (GOAL.md §5 re-runnability): link, but still store the re-run.
@@ -138,6 +141,7 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         matching: match?.summary,
         outstandingCount: match ? match.outstanding.length : 0,
         outstanding: match ? match.outstanding.slice(0, MAX_STORED_OUTSTANDING) : [],
+        reconciliation,
     });
     await recordAudit(user.id, 'lg.breakdown.ingested', 'lgRun', run.id, {
         filename,
@@ -147,6 +151,7 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         netFils: result.summary.netFils,
         asOf,
         outstandingCount: match ? match.outstanding.length : 0,
+        balanced: reconciliation?.balanced,
         duplicateOf: duplicates[0]?.id,
     });
     return created(run);

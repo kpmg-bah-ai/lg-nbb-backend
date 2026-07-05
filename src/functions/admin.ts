@@ -6,9 +6,13 @@ import { requireRole } from '../helpers/auth';
 import { badRequest, created, error, json, readJson } from '../helpers/json';
 import { Role } from '../shared/models';
 
+// NOTE: these live under /api/system/* because the Functions host reserves the
+// built-in /admin/* route space — an app route of admin/… fails registration with
+// "route conflicts with one or more built in routes" and never comes up.
+
 // One-shot bootstrap: creates the database and every container. Master-key only.
 app.http('admin-init-db', {
-    route: 'admin/init-db',
+    route: 'system/init-db',
     methods: ['POST'],
     authLevel: 'admin',
     handler: async () => {
@@ -32,7 +36,7 @@ interface BootstrapUserRequest {
 // master key, before any in-app user exists. Day-to-day provisioning goes through
 // /api/users with the role rules.
 app.http('admin-bootstrap-user', {
-    route: 'admin/users',
+    route: 'system/users',
     methods: ['POST'],
     authLevel: 'admin',
     handler: async (request) => {
@@ -67,7 +71,7 @@ app.http('admin-bootstrap-user', {
 
 // System check for admin users: Cosmos reachability and per-container document counts.
 app.http('admin-health', {
-    route: 'admin/health',
+    route: 'system/health',
     methods: ['GET'],
     authLevel: 'function',
     handler: async (request) => {
