@@ -5,7 +5,7 @@ import { join } from 'node:path';
 jest.mock('../../src/data/repositories', () => ({
     users: { get: jest.fn() },
     auditLogs: { create: jest.fn() },
-    lgRuns: { create: jest.fn(), get: jest.fn(), list: jest.fn() },
+    lgRuns: { create: jest.fn(), get: jest.fn(), list: jest.fn(), query: jest.fn() },
 }));
 
 import { auditLogs, lgRuns, users } from '../../src/data/repositories';
@@ -16,6 +16,7 @@ const mockUserGet = users.get as jest.Mock;
 const mockRunCreate = lgRuns.create as jest.Mock;
 const mockRunGet = lgRuns.get as jest.Mock;
 const mockRunList = lgRuns.list as jest.Mock;
+const mockRunQuery = lgRuns.query as jest.Mock;
 const mockAuditCreate = auditLogs.create as jest.Mock;
 
 const fixture = (name: string) => readFileSync(join(__dirname, '..', 'fixtures', 'lg', name));
@@ -61,7 +62,12 @@ beforeEach(() => {
         createdAt: '2026-07-01T00:00:00Z',
         updatedAt: '2026-07-01T00:00:00Z',
     }));
+    mockRunQuery.mockResolvedValue([]);
     mockAuditCreate.mockResolvedValue(undefined);
+});
+
+afterEach(() => {
+    delete process.env.LG_MAX_UPLOAD_BYTES;
 });
 
 describe('POST lg/runs (F1 upload + F9 persistence + F10 auth)', () => {
@@ -128,6 +134,134 @@ describe('POST lg/runs (F1 upload + F9 persistence + F10 auth)', () => {
         expect(mockRunCreate).not.toHaveBeenCalled();
     });
 
+    it('computes and stores F3 balances and F4 matching results with the run', async () => {
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'balanced-sample.csv' },
+                body: fixture('balanced-sample.csv'),
+            })
+        );
+        expect(response.status).toBe(201);
+        const run = response.jsonBody as LgRun;
+        expect(run.asOf).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+        expect(run.balances!.length).toBeGreaterThan(0);
+        // The balanced fixture nets to zero, so the F5 tie-out identity gives zero here too.
+        expect(run.balances!.reduce((s, b) => s + b.balanceFils, 0)).toBe(0);
+        expect(run.matching!.asOf).toBe(run.asOf);
+        expect(run.matching!.netOutstandingFils).toBe(0);
+        expect(run.outstandingCount).toBe(run.matching!.outstandingCount);
+        expect(run.outstanding!.length).toBe(run.outstandingCount);
+    });
+
+    it('honours an explicit ?asOf= review date', async () => {
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'balanced-sample.csv', asOf: '2020-01-01' },
+                body: fixture('balanced-sample.csv'),
+            })
+        );
+        expect(response.status).toBe(201);
+        const run = response.jsonBody as LgRun;
+        expect(run.asOf).toBe('2020-01-01');
+        // Every posting in the fixture is after 2020, so nothing is on the balance yet —
+        // and matching must operate on that same (empty) population: nothing outstanding.
+        expect(run.balances).toEqual([]);
+        expect(run.matching!.netOutstandingFils).toBe(0);
+        expect(run.matching!.matchedFils).toBe(0);
+        expect(run.outstanding).toEqual([]);
+    });
+
+    it('rejects a malformed asOf with 400', async () => {
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'balanced-sample.csv', asOf: 'June 2026' },
+                body: fixture('balanced-sample.csv'),
+            })
+        );
+        expect(response.status).toBe(400);
+        expect(mockRunCreate).not.toHaveBeenCalled();
+    });
+
+    it('rejects an impossible calendar asOf with 400', async () => {
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'balanced-sample.csv', asOf: '2026-02-31' },
+                body: fixture('balanced-sample.csv'),
+            })
+        );
+        expect(response.status).toBe(400);
+        expect(mockRunCreate).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 (not 500) when the multipart body cannot be parsed', async () => {
+        const response = await createLgRun(
+            fakeRequest({ headers: { 'x-user-id': 'u1', 'content-type': 'multipart/form-data' } })
+        );
+        expect(response.status).toBe(400);
+        expect(mockRunCreate).not.toHaveBeenCalled();
+    });
+
+    it('caps stored outstanding items but reports the full count', async () => {
+        const header = 'entity,Branch Number,gl,Post Date,Log description,ccy,Amount (BHD),Journal Number';
+        const rows = Array.from({ length: 510 }, (_, i) => `BH,1,D2810085,2023-01-08,020050 DEBIT POSTING,BHD,1.000,J${i}`);
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'many-unmatched.csv' },
+                body: Buffer.from([header, ...rows].join('\n')),
+            })
+        );
+        expect(response.status).toBe(201);
+        const run = response.jsonBody as LgRun;
+        expect(run.outstandingCount).toBe(510);
+        expect(run.outstanding).toHaveLength(500);
+        expect(run.matching!.outstandingCount).toBe(510);
+    });
+
+    it('links a re-upload of the same bytes via duplicateOf', async () => {
+        mockRunQuery.mockResolvedValue([{ id: 'run-0' }]);
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'balanced-sample.csv' },
+                body: fixture('balanced-sample.csv'),
+            })
+        );
+        expect(response.status).toBe(201);
+        expect((response.jsonBody as LgRun).duplicateOf).toBe('run-0');
+    });
+
+    it('rejects an oversized upload with 413 and stores nothing', async () => {
+        process.env.LG_MAX_UPLOAD_BYTES = '16';
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'balanced-sample.csv' },
+                body: fixture('balanced-sample.csv'),
+            })
+        );
+        expect(response.status).toBe(413);
+        expect(mockRunCreate).not.toHaveBeenCalled();
+    });
+
+    it('rejects a legacy .xls upload with 422', async () => {
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'legacy.xls' },
+                body: Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0x00, 0x00]),
+            })
+        );
+        expect(response.status).toBe(422);
+        const details = (response.jsonBody as { details: { errors: { code: string }[] } }).details;
+        expect(details.errors[0].code).toBe('UNSUPPORTED_FORMAT');
+        expect(mockRunCreate).not.toHaveBeenCalled();
+    });
+
     it('caps stored row errors but reports the full count', async () => {
         const header = 'entity,Branch Number,gl,Post Date,Log description,ccy,Amount (BHD),Journal Number';
         const badRow = 'BH,1,D2810085,2023-01-08,020050 DEBIT POSTING,BHD,not-a-number,J1';
@@ -140,6 +274,11 @@ describe('POST lg/runs (F1 upload + F9 persistence + F10 auth)', () => {
         expect(run.errorCount).toBe(150);
         expect(run.errors).toHaveLength(100);
         expect(run.summary.parsed).toBe(0);
+        // With zero postings there is nothing to balance or match — no fake summaries.
+        expect(run.balances).toEqual([]);
+        expect(run.matching).toBeUndefined();
+        expect(run.outstanding).toEqual([]);
+        expect(run.outstandingCount).toBe(0);
     });
 });
 

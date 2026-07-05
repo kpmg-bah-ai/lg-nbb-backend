@@ -144,6 +144,8 @@ export interface LedgerPosting extends BaseDocument {
     username?: string;
     /** 1-based source row number (data rows only, header excluded) for traceability. */
     rowNumber: number;
+    /** Worksheet the row came from (multi-sheet workbooks, GOAL.md §2.3). */
+    sheet?: string;
 }
 
 /**
@@ -156,6 +158,8 @@ export type ParsedPosting = Omit<LedgerPosting, keyof BaseDocument>;
 export type ParseErrorCode =
     | 'MISSING_HEADER'
     | 'EMPTY_INPUT'
+    | 'UNSUPPORTED_FORMAT'
+    | 'SHEET_SKIPPED'
     | 'MISSING_FIELD'
     | 'BAD_AMOUNT'
     | 'BAD_DATE'
@@ -169,6 +173,8 @@ export interface ParseError {
     /** 1-based data-row number; omitted for file/header-level problems. */
     row?: number;
     field?: CanonicalField;
+    /** Worksheet the problem relates to (multi-sheet workbooks). */
+    sheet?: string;
 }
 
 export interface ParseSummary {
@@ -188,23 +194,107 @@ export interface ParseResult {
     summary: ParseSummary;
 }
 
+// ---------- F3: GL balance ----------
+
+/** Per-branch GL balance derived from the postings as at `asOf` (GOAL.md §4 F3). */
+export interface BranchBalance {
+    entity: string;
+    gl: string;
+    branchNumber: string;
+    /** Signed integer fils (positive = net debit). */
+    balanceFils: number;
+    /** Display-only decimal — never for maths. */
+    balance: number;
+    postingCount: number;
+    firstPostDate?: string;
+    lastPostDate?: string;
+}
+
+// ---------- F4: matching ----------
+
+/** Aging per the sample statement: "Old Items" (> 1 year) vs "Less than 1 year". */
+export type AgeBucket = 'old' | 'current';
+
+export type OutstandingReason =
+    | 'UNMATCHED_DEBIT'
+    | 'UNMATCHED_CREDIT'
+    | 'PARTIALLY_MATCHED_DEBIT'
+    | 'PARTIALLY_MATCHED_CREDIT';
+
+/**
+ * A posting (or the unmatched remainder of one) left over after debit↔credit pairing
+ * (GOAL.md §3/§4 F4). Partial fragments arise from one-to-many clears, e.g. an 11k
+ * credit offset by 2k + 9k debits leaves nothing; offset by 9k alone leaves a 2k
+ * PARTIALLY_MATCHED_CREDIT fragment.
+ */
+export interface OutstandingItem {
+    entity: string;
+    gl: string;
+    branchNumber: string;
+    accountNumber?: string;
+    postDate: string;
+    direction: PostingDirection;
+    /** |amount| of the source posting, integer fils. */
+    originalFils: number;
+    /** Still-unmatched |amount|, integer fils (≤ originalFils; < ⇒ partial). */
+    outstandingFils: number;
+    /** Display-only decimal of outstandingFils. */
+    outstanding: number;
+    logCode?: string;
+    journalNumber: string;
+    sequence?: string;
+    /** Source data-row number (traceability, GOAL.md §5). */
+    rowNumber: number;
+    sheet?: string;
+    ageBucket: AgeBucket;
+    reason: OutstandingReason;
+}
+
+export interface MatchSummary {
+    /** Review date balances/aging were computed against (yyyy-mm-dd). */
+    asOf: string;
+    /** Fields whose combination pairs debits with credits (§9.2 — default, confirm). */
+    matchKey: string[];
+    /** |amount| fils successfully paired debit↔credit. */
+    matchedFils: number;
+    outstandingCount: number;
+    outstandingDebitFils: number;
+    outstandingCreditFils: number;
+    /** Σ signed outstanding — equals Σ signed postings (the F5 tie-out identity). */
+    netOutstandingFils: number;
+    oldCount: number;
+    currentCount: number;
+    byBranch: { branchNumber: string; outstandingCount: number; outstandingFils: number }[];
+}
+
 /**
  * A persisted reconciliation run (GOAL.md §4 F9): the uploaded breakdown's identity
- * (hash), parse summary and errors. Matching/reconciliation results (F4/F5) attach to
- * this document in later slices. Postings are not persisted — they are re-derivable
- * from the input, and 550k rows would blow Cosmos document limits.
+ * (hash), parse summary and errors, plus the F3 balances and F4 matching results
+ * computed at ingest. Postings are not persisted — they are re-derivable from the
+ * input, and 550k rows would blow Cosmos document limits.
  */
 export interface LgRun extends BaseDocument {
     filename?: string;
     format: 'xlsx' | 'csv';
     /** SHA-256 of the uploaded bytes — same input ⇒ same hash (GOAL.md §5 determinism). */
     inputSha256: string;
+    /** id of an earlier run with the same inputSha256, when one exists. */
+    duplicateOf?: string;
     /** User id of the uploader (F9 audit / F10 access control). */
     uploadedBy: string;
     summary: ParseSummary;
     /** Total number of parse errors; `errors` itself is capped when stored. */
     errorCount: number;
     errors: ParseError[];
+    /** Review date used for balances and aging (defaults to the latest post date). */
+    asOf?: string;
+    /** F3: per-branch balances as at asOf; capped when stored (see balancesCount). */
+    balances?: BranchBalance[];
+    balancesCount?: number;
+    /** F4: matching summary; `outstanding` is capped when stored (see outstandingCount). */
+    matching?: MatchSummary;
+    outstandingCount?: number;
+    outstanding?: OutstandingItem[];
 }
 
 /** BHD (and the sample data) use 3 decimal places. */

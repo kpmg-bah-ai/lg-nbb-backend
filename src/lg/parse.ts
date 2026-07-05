@@ -154,12 +154,19 @@ export function coerceDate(value: RawCell): string | undefined {
     const text = String(value).trim();
     const iso = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
     if (iso) {
-        return `${iso[1]}-${iso[2]}-${iso[3]}`;
+        const y = Number(iso[1]);
+        const m = Number(iso[2]);
+        const d = Number(iso[3]);
+        // Round-trip through Date.UTC to reject impossible calendar dates ('2026-02-31').
+        const date = new Date(Date.UTC(y, m - 1, d));
+        if (date.getUTCFullYear() === y && date.getUTCMonth() === m - 1 && date.getUTCDate() === d) {
+            return `${iso[1]}-${iso[2]}-${iso[3]}`;
+        }
+        return undefined;
     }
-    const parsed = new Date(text);
-    if (!isNaN(parsed.getTime())) {
-        return `${parsed.getUTCFullYear()}-${pad2(parsed.getUTCMonth() + 1)}-${pad2(parsed.getUTCDate())}`;
-    }
+    // Deliberately NO new Date(text) fallback: V8 parses non-ISO strings in host-local
+    // time (day shifts east of UTC) and month-first ('05/06' ⇒ 5 May), silently
+    // corrupting dd/mm data. A non-ISO string is a BAD_DATE the reviewer must see.
     return undefined;
 }
 
@@ -316,58 +323,120 @@ function isBlankRow(row: RawRow): boolean {
     return row.every((c) => c === null || c === undefined || String(c).trim() === '');
 }
 
+/** How many leading rows to scan for the header (real extracts can carry preamble/title rows). */
+const HEADER_SCAN_ROWS = 10;
+
 /**
- * Parses raw rows (row 0 = header) into a ParseResult. Header problems short-circuit
- * row parsing (there's nothing safe to map); row problems are collected, not thrown.
+ * Finds the header row within the first HEADER_SCAN_ROWS rows: the first row whose
+ * columns satisfy every REQUIRED_FIELDS alias. Returns -1 when none qualifies.
  */
-export function parseRows(rows: RawRow[]): ParseResult {
-    const empty: ParseResult = {
+export function findHeaderRow(rows: RawRow[], maxScan = HEADER_SCAN_ROWS): number {
+    const limit = Math.min(rows.length, maxScan);
+    for (let i = 0; i < limit; i++) {
+        if (isBlankRow(rows[i])) {
+            continue;
+        }
+        if (mapHeaders(rows[i]).errors.length === 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/** One worksheet's raw rows (csv input is a single unnamed sheet). */
+export interface SheetRows {
+    name?: string;
+    rows: RawRow[];
+}
+
+function emptyResult(): ParseResult {
+    return {
         postings: [],
         errors: [],
         summary: { dataRows: 0, parsed: 0, debitCount: 0, creditCount: 0, netFils: 0, currencies: [], branches: [] },
     };
-    if (!rows || rows.length === 0) {
-        return { ...empty, errors: [{ code: 'EMPTY_INPUT', message: 'The file contains no rows' }] };
-    }
+}
 
-    const header = mapHeaders(rows[0]);
-    if (header.errors.length > 0) {
-        return { ...empty, errors: header.errors };
+/**
+ * Parses one or more worksheets into a single ParseResult (GOAL.md §2.3: workbooks can
+ * carry extra sheets, e.g. a mismatched-items sheet next to the breakdown). Every sheet
+ * with a recognisable header contributes rows; sheets without one are reported as
+ * SHEET_SKIPPED, not fatal. Only when NO sheet has a valid header does the result carry
+ * the MISSING_HEADER errors (from the first non-empty sheet, so messages stay concrete).
+ * Data-row numbering is continuous across sheets so rowNumber stays unique per run.
+ */
+export function parseSheets(sheets: SheetRows[]): ParseResult {
+    const nonEmpty = sheets.filter((s) => s.rows.length > 0 && !s.rows.every(isBlankRow));
+    if (nonEmpty.length === 0) {
+        return { ...emptyResult(), errors: [{ code: 'EMPTY_INPUT', message: 'The file contains no rows' }] };
     }
 
     const postings: ParsedPosting[] = [];
     const errors: ParseError[] = [];
+    const skipped: ParseError[] = [];
     let dataRows = 0;
     let debitCount = 0;
     let creditCount = 0;
     let netFils = 0;
     const currencies = new Set<string>();
     const branches = new Set<string>();
+    let anyValidSheet = false;
 
-    for (let i = 1; i < rows.length; i++) {
-        const row = rows[i];
-        if (isBlankRow(row)) {
+    for (const sheet of nonEmpty) {
+        const headerIndex = findHeaderRow(sheet.rows);
+        if (headerIndex < 0) {
+            skipped.push({
+                code: 'SHEET_SKIPPED',
+                sheet: sheet.name,
+                message: `Worksheet ${
+                    sheet.name ? `"${sheet.name}"` : '(unnamed)'
+                } has no recognisable breakdown header row — skipped`,
+            });
             continue;
         }
-        dataRows++;
-        const { posting, errors: rowErrors } = normalizeRow(row, header.columns, dataRows);
-        errors.push(...rowErrors);
-        if (posting) {
-            postings.push(posting);
-            netFils += posting.amountBhdFils;
-            if (posting.direction === 'debit') {
-                debitCount++;
-            } else {
-                creditCount++;
+        anyValidSheet = true;
+        const { columns } = mapHeaders(sheet.rows[headerIndex]);
+
+        for (let i = headerIndex + 1; i < sheet.rows.length; i++) {
+            const row = sheet.rows[i];
+            if (isBlankRow(row)) {
+                continue;
             }
-            currencies.add(posting.currency);
-            branches.add(posting.branchNumber);
+            dataRows++;
+            const { posting, errors: rowErrors } = normalizeRow(row, columns, dataRows);
+            for (const err of rowErrors) {
+                errors.push(sheet.name ? { ...err, sheet: sheet.name } : err);
+            }
+            if (posting) {
+                posting.sheet = sheet.name;
+                postings.push(posting);
+                netFils += posting.amountBhdFils;
+                if (posting.direction === 'debit') {
+                    debitCount++;
+                } else {
+                    creditCount++;
+                }
+                currencies.add(posting.currency);
+                branches.add(posting.branchNumber);
+            }
         }
+    }
+
+    if (!anyValidSheet) {
+        // Nothing was mappable: surface the concrete missing headers of the first sheet.
+        const first = nonEmpty[0];
+        const headerErrors = mapHeaders(first.rows[0]).errors.map((e) =>
+            first.name ? { ...e, sheet: first.name } : e
+        );
+        return {
+            ...emptyResult(),
+            errors: nonEmpty.length > 1 ? [...headerErrors, ...skipped.slice(1)] : headerErrors,
+        };
     }
 
     return {
         postings,
-        errors,
+        errors: [...skipped, ...errors],
         summary: {
             dataRows,
             parsed: postings.length,
@@ -378,4 +447,12 @@ export function parseRows(rows: RawRow[]): ParseResult {
             branches: [...branches].sort(),
         },
     };
+}
+
+/**
+ * Parses a single sheet's raw rows into a ParseResult. Header problems short-circuit
+ * row parsing (there's nothing safe to map); row problems are collected, not thrown.
+ */
+export function parseRows(rows: RawRow[]): ParseResult {
+    return parseSheets([{ rows: rows ?? [] }]);
 }

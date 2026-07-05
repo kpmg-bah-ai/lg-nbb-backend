@@ -1,17 +1,20 @@
 /**
  * LG reconciliation — ingest a breakdown file into raw rows, then normalise
- * (GOAL.md §4 F1). Supports `.xlsx` (via exceljs) and `.csv`. Header validation
- * and row normalisation live in parse.ts; this layer only turns bytes into
- * `RawRow[]` and delegates.
+ * (GOAL.md §4 F1). Supports `.xlsx` (via the exceljs *streaming* WorkbookReader —
+ * rows are read one at a time instead of materialising the whole workbook DOM,
+ * which matters at the ~550k-row production size, GOAL.md §5) and `.csv`.
  *
- * NOTE (scale, GOAL.md §5): this reads the whole workbook into memory via
- * exceljs `xlsx.load`. The ~550k-row production file works but is memory-heavy;
- * swapping to exceljs's streaming `WorkbookReader` is a follow-up (perf slice).
+ * Every worksheet is read (GOAL.md §2.3): sheets whose header matches the breakdown
+ * schema contribute rows; others are skipped with a SHEET_SKIPPED note. Legacy `.xls`
+ * (BIFF/OLE) files are rejected with UNSUPPORTED_FORMAT — exceljs cannot read them.
+ * Header validation and row normalisation live in parse.ts; this layer only turns
+ * bytes into rows and delegates.
  */
 
+import { Readable } from 'node:stream';
 import * as ExcelJS from 'exceljs';
 import { ParseResult, RawCell, RawRow } from '../shared/models';
-import { parseRows } from './parse';
+import { parseSheets, SheetRows } from './parse';
 
 export type IngestFormat = 'xlsx' | 'csv';
 
@@ -26,7 +29,11 @@ function unwrapCell(value: unknown): RawCell {
     if (typeof value === 'object') {
         const v = value as Record<string, unknown>;
         if ('result' in v) {
-            return v.result as RawCell; // { formula, result }
+            const result = v.result; // { formula, result }
+            if (result !== null && typeof result === 'object' && !(result instanceof Date)) {
+                return undefined; // cached formula ERROR result, e.g. { error: '#N/A' }
+            }
+            return result as RawCell;
         }
         if ('text' in v) {
             return v.text as RawCell; // { text, hyperlink }
@@ -42,25 +49,75 @@ function unwrapCell(value: unknown): RawCell {
     return value as RawCell;
 }
 
-/** Reads the first worksheet of an xlsx workbook into 0-indexed raw rows. */
-export async function rowsFromXlsx(buffer: Buffer): Promise<RawRow[]> {
+/** OLE compound-file magic bytes — a legacy `.xls` (BIFF) workbook, which exceljs cannot read. */
+export function isLegacyXls(buffer: Buffer): boolean {
+    const magic = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
+    return buffer.length >= magic.length && magic.every((byte, i) => buffer[i] === byte);
+}
+
+/**
+ * Streams every worksheet of an xlsx workbook into raw 0-indexed rows. Uses the
+ * exceljs streaming WorkbookReader: rows are emitted one at a time, so memory holds
+ * raw cell values only — never the full workbook object model.
+ */
+async function sheetsFromXlsxStream(buffer: Buffer): Promise<SheetRows[]> {
+    const reader = new ExcelJS.stream.xlsx.WorkbookReader(Readable.from([buffer]), {
+        entries: 'emit',
+        sharedStrings: 'cache',
+        hyperlinks: 'ignore',
+        styles: 'cache',
+        worksheets: 'emit',
+    });
+    const sheets: SheetRows[] = [];
+    let index = 0;
+    for await (const worksheet of reader) {
+        index++;
+        const rows: RawRow[] = [];
+        for await (const row of worksheet) {
+            // row.values is 1-indexed (index 0 is empty); rebuild a dense 0-indexed array.
+            const values = row.values as unknown[];
+            const out: RawRow = [];
+            for (let c = 1; c < values.length; c++) {
+                out[c - 1] = unwrapCell(values[c]);
+            }
+            rows.push(out);
+        }
+        const name = (worksheet as unknown as { name?: string }).name;
+        sheets.push({ name: name || `Sheet${index}`, rows });
+    }
+    return sheets;
+}
+
+/** Non-streaming fallback: the full workbook DOM, reading every worksheet. */
+async function sheetsFromXlsxDom(buffer: Buffer): Promise<SheetRows[]> {
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.load(buffer as unknown as ExcelJS.Buffer);
-    const worksheet = workbook.worksheets[0];
-    if (!worksheet) {
-        return [];
-    }
-    const rows: RawRow[] = [];
-    worksheet.eachRow({ includeEmpty: false }, (row) => {
-        // row.values is 1-indexed (index 0 is empty); rebuild a dense 0-indexed array.
-        const values = row.values as unknown[];
-        const out: RawRow = [];
-        for (let c = 1; c < values.length; c++) {
-            out[c - 1] = unwrapCell(values[c]);
-        }
-        rows.push(out);
+    return workbook.worksheets.map((worksheet, i) => {
+        const rows: RawRow[] = [];
+        worksheet.eachRow({ includeEmpty: false }, (row) => {
+            const values = row.values as unknown[];
+            const out: RawRow = [];
+            for (let c = 1; c < values.length; c++) {
+                out[c - 1] = unwrapCell(values[c]);
+            }
+            rows.push(out);
+        });
+        return { name: worksheet.name || `Sheet${i + 1}`, rows };
     });
-    return rows;
+}
+
+/**
+ * Reads every worksheet, preferring the streaming reader (GOAL.md §5 scale). The
+ * exceljs streaming reader throws when a worksheet zip entry precedes xl/workbook.xml
+ * (entry order is not guaranteed by all writers), so fall back to the in-memory
+ * reader rather than failing the upload.
+ */
+export async function sheetsFromXlsx(buffer: Buffer): Promise<SheetRows[]> {
+    try {
+        return await sheetsFromXlsxStream(buffer);
+    } catch {
+        return sheetsFromXlsxDom(buffer);
+    }
 }
 
 /** Minimal RFC-4180-ish CSV parser (quotes, escaped quotes, CRLF/LF). */
@@ -146,9 +203,30 @@ export interface IngestOptions {
     format?: IngestFormat;
 }
 
-/** Ingests a breakdown file (xlsx or csv) into a ParseResult. */
+/** Ingests a breakdown file (xlsx or csv, any number of worksheets) into a ParseResult. */
 export async function ingest(buffer: Buffer, options: IngestOptions = {}): Promise<ParseResult> {
+    if (isLegacyXls(buffer)) {
+        return {
+            postings: [],
+            errors: [
+                {
+                    code: 'UNSUPPORTED_FORMAT',
+                    message:
+                        'Legacy .xls (BIFF) and password-protected workbooks are not supported — re-save the file as an unencrypted .xlsx or export .csv',
+                },
+            ],
+            summary: {
+                dataRows: 0,
+                parsed: 0,
+                debitCount: 0,
+                creditCount: 0,
+                netFils: 0,
+                currencies: [],
+                branches: [],
+            },
+        };
+    }
     const format = detectFormat(buffer, options.filename, options.format);
-    const rows = format === 'xlsx' ? await rowsFromXlsx(buffer) : rowsFromCsv(buffer);
-    return parseRows(rows);
+    const sheets: SheetRows[] = format === 'xlsx' ? await sheetsFromXlsx(buffer) : [{ rows: rowsFromCsv(buffer) }];
+    return parseSheets(sheets);
 }
