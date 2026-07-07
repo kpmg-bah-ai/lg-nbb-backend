@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Container, SqlParameter, SqlQuerySpec } from '@azure/cosmos';
-import { getContainer } from '../data/cosmos';
+import { evictContainer, getContainer } from '../data/cosmos';
 
 export interface BaseDocument {
     id: string;
@@ -43,11 +43,27 @@ export class CrudHelper<T extends BaseDocument> {
         return getContainer(this.containerId, this.partitionKeyPath);
     }
 
+    /**
+     * Runs an operation whose 404 can only mean the container itself is missing
+     * (never a missing document): evicts the cached handle and retries once so a
+     * warm process heals after the container is deleted/recreated under it.
+     */
+    private async withContainer<R>(operation: (container: Container) => Promise<R>): Promise<R> {
+        try {
+            return await operation(await this.container());
+        } catch (error) {
+            if (!isNotFound(error)) {
+                throw error;
+            }
+            evictContainer(this.containerId);
+            return operation(await this.container());
+        }
+    }
+
     async create(data: Omit<T, keyof BaseDocument> & { id?: string }): Promise<T> {
         const now = new Date().toISOString();
         const doc = { ...data, id: data.id ?? randomUUID(), createdAt: now, updatedAt: now } as unknown as T;
-        const container = await this.container();
-        const { resource } = await container.items.create<T>(doc);
+        const { resource } = await this.withContainer((container) => container.items.create<T>(doc));
         return resource as T;
     }
 
@@ -66,20 +82,21 @@ export class CrudHelper<T extends BaseDocument> {
 
     async list(options: ListOptions = {}): Promise<ListResult<T>> {
         const query = options.query ?? { query: 'SELECT * FROM c ORDER BY c.createdAt DESC' };
-        const container = await this.container();
-        const iterator = container.items.query<T>(query, {
-            maxItemCount: options.maxItems ?? 50,
-            continuationToken: options.continuationToken,
-        });
-        const response = await iterator.fetchNext();
+        const response = await this.withContainer((container) =>
+            container.items
+                .query<T>(query, {
+                    maxItemCount: options.maxItems ?? 50,
+                    continuationToken: options.continuationToken,
+                })
+                .fetchNext()
+        );
         // A fresh/empty container can yield undefined resources — never leak that shape.
         return { items: response.resources ?? [], continuationToken: response.continuationToken };
     }
 
     /** Runs an arbitrary SQL query and returns all results (no paging). */
     async query<R = T>(spec: SqlQuerySpec): Promise<R[]> {
-        const container = await this.container();
-        const { resources } = await container.items.query<R>(spec).fetchAll();
+        const { resources } = await this.withContainer((container) => container.items.query<R>(spec).fetchAll());
         return resources;
     }
 
@@ -115,8 +132,7 @@ export class CrudHelper<T extends BaseDocument> {
     async upsert(doc: Omit<T, 'createdAt' | 'updatedAt'> & Partial<BaseDocument>): Promise<T> {
         const now = new Date().toISOString();
         const full = { createdAt: now, ...doc, updatedAt: now } as unknown as T;
-        const container = await this.container();
-        const { resource } = await container.items.upsert<T>(full);
+        const { resource } = await this.withContainer((container) => container.items.upsert<T>(full));
         return resource as T;
     }
 

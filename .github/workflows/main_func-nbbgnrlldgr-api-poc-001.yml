@@ -66,6 +66,7 @@ jobs:
         id: fa
         with:
           app-name: 'func-nbbgnrlldgr-api-poc-001'
-          slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_BFA7B01E001C4B2FB0FD4628E332BC89 }}
+          sku: 'flexconsumption'
+          remote-build: false

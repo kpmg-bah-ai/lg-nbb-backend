@@ -39,7 +39,22 @@ export function getContainer(containerId: string, partitionKeyPath = '/id'): Pro
             });
             return container;
         })();
+        // A failed provisioning attempt must not poison the cache for the process lifetime.
+        cached.catch(() => {
+            if (containerCache.get(containerId) === cached) {
+                containerCache.delete(containerId);
+            }
+        });
         containerCache.set(containerId, cached);
     }
     return cached;
+}
+
+/**
+ * Drops the cached handle so the next getContainer() re-provisions. Needed when
+ * the container is deleted out from under a warm process (e.g. a data reset):
+ * operations on the stale handle fail 404 until the handle is rebuilt.
+ */
+export function evictContainer(containerId: string): void {
+    containerCache.delete(containerId);
 }
