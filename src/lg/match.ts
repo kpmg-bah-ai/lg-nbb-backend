@@ -18,7 +18,15 @@
  * the review date is an "Old Item", otherwise current ("Less than 1 year", §9.4).
  */
 
-import { AgeBucket, filsToBhd, MatchSummary, OutstandingItem, ParsedPosting } from '../shared/models';
+import {
+    AgeBucket,
+    filsToBhd,
+    MatchedLeg,
+    MatchedSet,
+    MatchSummary,
+    OutstandingItem,
+    ParsedPosting,
+} from '../shared/models';
 import { deriveAsOf } from './balance';
 
 export const DEFAULT_MATCH_KEY: (keyof ParsedPosting)[] = ['entity', 'gl', 'branchNumber', 'accountNumber'];
@@ -35,6 +43,8 @@ export interface MatchOptions {
 
 export interface MatchResult {
     outstanding: OutstandingItem[];
+    /** Cleared sets — how each instrument/chain actually cleared (GOAL-2 G1). */
+    matchedSets: MatchedSet[];
     summary: MatchSummary;
 }
 
@@ -82,7 +92,22 @@ function toOutstanding(leg: Leg, asOf: string, oldAfterDays: number): Outstandin
     };
 }
 
-/** Pairs debits with credits per match-key group; returns what could not be cleared. */
+function toMatchedLeg(leg: Leg, matchedFils: number): MatchedLeg {
+    const p = leg.posting;
+    return {
+        postDate: p.postDate,
+        direction: p.direction,
+        originalFils: Math.abs(p.amountBhdFils),
+        matchedFils,
+        journalNumber: p.journalNumber,
+        sequence: p.sequence,
+        logCode: p.logCode,
+        rowNumber: p.rowNumber,
+        sheet: p.sheet,
+    };
+}
+
+/** Pairs debits with credits per match-key group; returns the cleared sets and what could not be cleared. */
 export function matchPostings(postings: ParsedPosting[], options: MatchOptions = {}): MatchResult {
     const matchKey = options.matchKey ?? DEFAULT_MATCH_KEY;
     const oldAfterDays = options.oldAfterDays ?? OLD_AFTER_DAYS;
@@ -105,6 +130,7 @@ export function matchPostings(postings: ParsedPosting[], options: MatchOptions =
     }
 
     const outstanding: OutstandingItem[] = [];
+    const matchedSets: MatchedSet[] = [];
     let matchedFils = 0;
 
     for (const group of groups.values()) {
@@ -122,7 +148,9 @@ export function matchPostings(postings: ParsedPosting[], options: MatchOptions =
         }
 
         // FIFO offset: consume the oldest debit against the oldest credit, splitting
-        // whichever is larger — this is what makes 11k = 2k + 9k a full clear.
+        // whichever is larger — this is what makes 11k = 2k + 9k a full clear. Each
+        // offset is recorded so cleared sets can be reconstructed below (G1).
+        const offsets: { d: number; c: number; fils: number }[] = [];
         let d = 0;
         let c = 0;
         while (d < debits.length && c < credits.length) {
@@ -130,12 +158,74 @@ export function matchPostings(postings: ParsedPosting[], options: MatchOptions =
             debits[d].remainingFils -= offset;
             credits[c].remainingFils -= offset;
             matchedFils += offset;
+            offsets.push({ d, c, fils: offset });
             if (debits[d].remainingFils === 0) {
                 d++;
             }
             if (credits[c].remainingFils === 0) {
                 c++;
             }
+        }
+
+        // Cleared sets: connected components of the offset graph. FIFO advances d and c
+        // monotonically, so a new offset either shares a leg with the running component
+        // (same debit or same credit still being consumed) or — when the previous offset
+        // exhausted both legs at once — starts a fresh component.
+        const components: { offsets: typeof offsets; debitIdx: Set<number>; creditIdx: Set<number> }[] = [];
+        for (const off of offsets) {
+            const current = components[components.length - 1];
+            if (current && (current.debitIdx.has(off.d) || current.creditIdx.has(off.c))) {
+                current.offsets.push(off);
+                current.debitIdx.add(off.d);
+                current.creditIdx.add(off.c);
+            } else {
+                components.push({ offsets: [off], debitIdx: new Set([off.d]), creditIdx: new Set([off.c]) });
+            }
+        }
+
+        for (const component of components) {
+            const legMatched = new Map<string, number>();
+            let setFils = 0;
+            for (const off of component.offsets) {
+                setFils += off.fils;
+                legMatched.set(`d${off.d}`, (legMatched.get(`d${off.d}`) ?? 0) + off.fils);
+                legMatched.set(`c${off.c}`, (legMatched.get(`c${off.c}`) ?? 0) + off.fils);
+            }
+            const debitLegs = [...component.debitIdx]
+                .sort((a, b) => a - b)
+                .map((i) => toMatchedLeg(debits[i], legMatched.get(`d${i}`) ?? 0));
+            const creditLegs = [...component.creditIdx]
+                .sort((a, b) => a - b)
+                .map((i) => toMatchedLeg(credits[i], legMatched.get(`c${i}`) ?? 0));
+            const fullyCleared =
+                [...component.debitIdx].every((i) => debits[i].remainingFils === 0) &&
+                [...component.creditIdx].every((i) => credits[i].remainingFils === 0);
+            const participants = [
+                ...[...component.debitIdx].map((i) => debits[i].posting),
+                ...[...component.creditIdx].map((i) => credits[i].posting),
+            ];
+            const accounts = new Set(participants.map((p) => p.accountNumber));
+            const firstCreditDate = creditLegs.reduce(
+                (min, l) => (l.postDate < min ? l.postDate : min),
+                creditLegs[0].postDate
+            );
+            const finalDebitDate = debitLegs.reduce(
+                (max, l) => (l.postDate > max ? l.postDate : max),
+                debitLegs[0].postDate
+            );
+            matchedSets.push({
+                entity: participants[0].entity,
+                gl: participants[0].gl,
+                branchNumber: participants[0].branchNumber,
+                accountNumber: accounts.size === 1 ? participants[0].accountNumber : undefined,
+                matchedFils: setFils,
+                creditLegs,
+                debitLegs,
+                firstCreditDate,
+                finalDebitDate,
+                settledDays: daysBetween(firstCreditDate, finalDebitDate),
+                fullyCleared,
+            });
         }
 
         for (const leg of [...debits, ...credits]) {
@@ -150,11 +240,31 @@ export function matchPostings(postings: ParsedPosting[], options: MatchOptions =
             a.branchNumber.localeCompare(b.branchNumber) ||
             (a.postDate < b.postDate ? -1 : a.postDate > b.postDate ? 1 : a.rowNumber - b.rowNumber)
     );
+    matchedSets.sort(
+        (a, b) =>
+            a.branchNumber.localeCompare(b.branchNumber) ||
+            (a.firstCreditDate < b.firstCreditDate
+                ? -1
+                : a.firstCreditDate > b.firstCreditDate
+                ? 1
+                : a.creditLegs[0].rowNumber - b.creditLegs[0].rowNumber)
+    );
 
     let outstandingDebitFils = 0;
     let outstandingCreditFils = 0;
     let oldCount = 0;
-    const byBranch = new Map<string, { branchNumber: string; outstandingCount: number; outstandingFils: number }>();
+    const byBranch = new Map<
+        string,
+        { branchNumber: string; outstandingCount: number; outstandingFils: number; matchedSetCount: number }
+    >();
+    const branchEntry = (branchNumber: string) => {
+        let branch = byBranch.get(branchNumber);
+        if (!branch) {
+            branch = { branchNumber, outstandingCount: 0, outstandingFils: 0, matchedSetCount: 0 };
+            byBranch.set(branchNumber, branch);
+        }
+        return branch;
+    };
     for (const item of outstanding) {
         if (item.direction === 'debit') {
             outstandingDebitFils += item.outstandingFils;
@@ -164,13 +274,12 @@ export function matchPostings(postings: ParsedPosting[], options: MatchOptions =
         if (item.ageBucket === 'old') {
             oldCount++;
         }
-        let branch = byBranch.get(item.branchNumber);
-        if (!branch) {
-            branch = { branchNumber: item.branchNumber, outstandingCount: 0, outstandingFils: 0 };
-            byBranch.set(item.branchNumber, branch);
-        }
+        const branch = branchEntry(item.branchNumber);
         branch.outstandingCount++;
         branch.outstandingFils += item.direction === 'debit' ? item.outstandingFils : -item.outstandingFils;
+    }
+    for (const set of matchedSets) {
+        branchEntry(set.branchNumber).matchedSetCount++;
     }
 
     const summary: MatchSummary = {
@@ -183,8 +292,10 @@ export function matchPostings(postings: ParsedPosting[], options: MatchOptions =
         netOutstandingFils: outstandingDebitFils - outstandingCreditFils,
         oldCount,
         currentCount: outstanding.length - oldCount,
+        matchedSetCount: matchedSets.length,
+        fullyClearedSetCount: matchedSets.filter((s) => s.fullyCleared).length,
         byBranch: [...byBranch.values()].sort((a, b) => a.branchNumber.localeCompare(b.branchNumber)),
     };
 
-    return { outstanding, summary };
+    return { outstanding, matchedSets, summary };
 }

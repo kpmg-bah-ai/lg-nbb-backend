@@ -184,8 +184,8 @@ describe('matchPostings (F4) — the F5 tie-out identity and rollups', () => {
             makePosting({ amountBhdFils: -78_500, branchNumber: '2', accountNumber: 'D' }),
         ]);
         expect(summary.byBranch).toEqual([
-            { branchNumber: '1', outstandingCount: 1, outstandingFils: -3 * K },
-            { branchNumber: '2', outstandingCount: 2, outstandingFils: 340_463 - 78_500 },
+            { branchNumber: '1', outstandingCount: 1, outstandingFils: -3 * K, matchedSetCount: 0 },
+            { branchNumber: '2', outstandingCount: 2, outstandingFils: 340_463 - 78_500, matchedSetCount: 0 },
         ]);
         expect(summary.outstandingDebitFils).toBe(340_463);
         expect(summary.outstandingCreditFils).toBe(3 * K + 78_500);

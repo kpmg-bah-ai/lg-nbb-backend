@@ -6,10 +6,18 @@ jest.mock('../../src/data/repositories', () => ({
     users: { get: jest.fn() },
     auditLogs: { create: jest.fn() },
     lgRuns: { create: jest.fn(), get: jest.fn(), list: jest.fn(), query: jest.fn() },
+    lgRunDetails: { create: jest.fn(), query: jest.fn() },
 }));
 
-import { auditLogs, lgRuns, users } from '../../src/data/repositories';
-import { createLgRun, getLgRun, listLgRuns } from '../../src/functions/lg';
+import { auditLogs, lgRunDetails, lgRuns, users } from '../../src/data/repositories';
+import {
+    createLgRun,
+    exportLgRun,
+    getLgRun,
+    listLgRunExceptions,
+    listLgRunMatched,
+    listLgRuns,
+} from '../../src/functions/lg';
 import { LgRun, User } from '../../src/shared/models';
 
 const mockUserGet = users.get as jest.Mock;
@@ -18,6 +26,8 @@ const mockRunGet = lgRuns.get as jest.Mock;
 const mockRunList = lgRuns.list as jest.Mock;
 const mockRunQuery = lgRuns.query as jest.Mock;
 const mockAuditCreate = auditLogs.create as jest.Mock;
+const mockDetailCreate = lgRunDetails.create as jest.Mock;
+const mockDetailQuery = lgRunDetails.query as jest.Mock;
 
 const fixture = (name: string) => readFileSync(join(__dirname, '..', 'fixtures', 'lg', name));
 
@@ -64,6 +74,8 @@ beforeEach(() => {
     }));
     mockRunQuery.mockResolvedValue([]);
     mockAuditCreate.mockResolvedValue(undefined);
+    mockDetailCreate.mockImplementation(async (doc: Record<string, unknown>) => ({ ...doc, id: 'chunk-1' }));
+    mockDetailQuery.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -284,6 +296,200 @@ describe('POST lg/runs (F1 upload + F9 persistence + F10 auth)', () => {
         expect(run.matching).toBeUndefined();
         expect(run.outstanding).toEqual([]);
         expect(run.outstandingCount).toBe(0);
+    });
+});
+
+describe('POST lg/runs — F6 detail storage (G2/G3)', () => {
+    it('stores matched-set chunks for a balanced upload and reports the counts', async () => {
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'balanced-sample.csv' },
+                body: fixture('balanced-sample.csv'),
+            })
+        );
+        expect(response.status).toBe(201);
+        const run = response.jsonBody as LgRun;
+        expect(run.matchedSetCount).toBeGreaterThan(0);
+        expect(run.matching!.matchedSetCount).toBe(run.matchedSetCount);
+        // Fully balanced ⇒ nothing outstanding ⇒ zero exceptions, and no exception chunks.
+        expect(run.exceptionCount).toBe(0);
+        expect(mockDetailCreate).toHaveBeenCalledWith(
+            expect.objectContaining({ runId: 'run-1', kind: 'matchedSets', seq: 0 })
+        );
+        expect(mockDetailCreate).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'exceptions' }));
+    });
+
+    it('classifies duplicates and near-miss amounts at ingest (end-to-end G2)', async () => {
+        const header = 'entity,Branch Number,gl,Account Number,Post Date,Log description,ccy,Amount (BHD),Journal Number';
+        const rows = [
+            'BH,1,D2810085,ACC-T,2025-03-14,020030 BGL CR POSTING,BHD,-0.555,JR', // retry twin 1
+            'BH,1,D2810085,ACC-T,2025-03-14,020030 BGL CR POSTING,BHD,-0.555,JR', // retry twin 2
+            'BH,1,D2810085,ACC-A,2025-01-01,020050 DEBIT POSTING,BHD,10.000,J1', // near-miss debit
+            'BH,1,D2810085,ACC-B,2025-01-05,020030 BGL CR POSTING,BHD,-10.500,J2', // near-miss credit
+        ];
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'classified.csv' },
+                body: Buffer.from([header, ...rows].join('\n')),
+            })
+        );
+        expect(response.status).toBe(201);
+        const run = response.jsonBody as LgRun;
+        expect(run.exceptionCount).toBe(4);
+        expect(run.exceptionsSummary!.byReason.DUPLICATE).toBe(2);
+        expect(run.exceptionsSummary!.byReason.AMOUNT_MISMATCH).toBe(2);
+        expect(mockDetailCreate).toHaveBeenCalledWith(
+            expect.objectContaining({ runId: 'run-1', kind: 'exceptions', seq: 0 })
+        );
+    });
+
+    it('chunks large detail sets and honours the LG_MAX_DETAIL_ITEMS cap visibly', async () => {
+        process.env.LG_MAX_DETAIL_ITEMS = '300';
+        const header = 'entity,Branch Number,gl,Post Date,Log description,ccy,Amount (BHD),Journal Number';
+        const rows = Array.from(
+            { length: 400 },
+            (_, i) => `BH,1,D2810085,2023-01-08,020050 DEBIT POSTING,BHD,${i + 1}.000,J${i}`
+        );
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'many.csv' },
+                body: Buffer.from([header, ...rows].join('\n')),
+            })
+        );
+        delete process.env.LG_MAX_DETAIL_ITEMS;
+        expect(response.status).toBe(201);
+        const run = response.jsonBody as LgRun;
+        // The true total is reported even though storage was capped at 300 (250 + 50).
+        expect(run.exceptionCount).toBe(400);
+        const exceptionChunks = mockDetailCreate.mock.calls
+            .map(([doc]) => doc as { kind: string; seq: number; items: unknown[] })
+            .filter((doc) => doc.kind === 'exceptions');
+        expect(exceptionChunks.map((c) => c.items.length)).toEqual([250, 50]);
+    });
+});
+
+describe('GET lg/runs/{id}/matched and /exceptions (G3)', () => {
+    const chunks = (kind: string) => [
+        { id: 'k0', runId: 'run-1', kind, seq: 0, items: [{ n: 1 }, { n: 2 }, { n: 3 }] },
+        { id: 'k1', runId: 'run-1', kind, seq: 1, items: [{ n: 4 }, { n: 5 }] },
+    ];
+
+    it('rejects anonymous requests with 401', async () => {
+        const response = await listLgRunMatched(fakeRequest({ params: { id: 'run-1' } }));
+        expect(response.status).toBe(401);
+    });
+
+    it('returns 404 for an unknown run', async () => {
+        mockRunGet.mockResolvedValue(undefined);
+        const response = await listLgRunExceptions(
+            fakeRequest({ headers: { 'x-user-id': 'u1' }, params: { id: 'nope' } })
+        );
+        expect(response.status).toBe(404);
+    });
+
+    it('pages matched sets with offset/maxItems and reports total vs storedCount', async () => {
+        mockRunGet.mockResolvedValue({ id: 'run-1', matchedSetCount: 9 });
+        mockDetailQuery.mockResolvedValue(chunks('matchedSets'));
+        const response = await listLgRunMatched(
+            fakeRequest({ headers: { 'x-user-id': 'u1' }, params: { id: 'run-1' }, query: { offset: '1', maxItems: '2' } })
+        );
+        expect(response.status).toBe(200);
+        const body = response.jsonBody as { items: { n: number }[]; total: number; storedCount: number; offset: number };
+        expect(body.items.map((i) => i.n)).toEqual([2, 3]);
+        expect(body.offset).toBe(1);
+        expect(body.storedCount).toBe(5);
+        expect(body.total).toBe(9); // storedCount < total ⇒ the cap is visible, never silent
+        expect(mockDetailQuery).toHaveBeenCalledWith(
+            expect.objectContaining({
+                parameters: expect.arrayContaining([{ name: '@kind', value: 'matchedSets' }]),
+            })
+        );
+    });
+
+    it('pages exceptions the same way', async () => {
+        mockRunGet.mockResolvedValue({ id: 'run-1', exceptionCount: 5 });
+        mockDetailQuery.mockResolvedValue(chunks('exceptions'));
+        const response = await listLgRunExceptions(
+            fakeRequest({ headers: { 'x-user-id': 'u1' }, params: { id: 'run-1' }, query: { offset: '3' } })
+        );
+        expect(response.status).toBe(200);
+        const body = response.jsonBody as { items: { n: number }[]; total: number };
+        expect(body.items.map((i) => i.n)).toEqual([4, 5]);
+        expect(body.total).toBe(5);
+    });
+});
+
+describe('GET lg/runs/{id}/export (G5)', () => {
+    const reconBlock = {
+        entity: 'BH',
+        gl: 'D2810085',
+        branchNumber: '1',
+        glBalanceFils: 46_500,
+        outstandingNetFils: 46_500,
+        outstandingCount: 2,
+        oldCount: 1,
+        oldFils: 125_000,
+        currentCount: 1,
+        currentFils: 78_500,
+        differenceFils: 0,
+        difference: 0,
+        balanced: true,
+    };
+
+    it('rejects anonymous requests with 401', async () => {
+        const response = await exportLgRun(fakeRequest({ params: { id: 'run-1' } }));
+        expect(response.status).toBe(401);
+    });
+
+    it('returns 404 for an unknown run', async () => {
+        mockRunGet.mockResolvedValue(undefined);
+        const response = await exportLgRun(fakeRequest({ headers: { 'x-user-id': 'u1' }, params: { id: 'x' } }));
+        expect(response.status).toBe(404);
+    });
+
+    it('returns 400 when the run has no reconciliation', async () => {
+        mockRunGet.mockResolvedValue({ id: 'run-1' });
+        const response = await exportLgRun(fakeRequest({ headers: { 'x-user-id': 'u1' }, params: { id: 'run-1' } }));
+        expect(response.status).toBe(400);
+    });
+
+    it('requires ?branch= when the run covers several branches', async () => {
+        mockRunGet.mockResolvedValue({
+            id: 'run-1',
+            reconciliation: {
+                byBranch: [reconBlock, { ...reconBlock, branchNumber: '2' }],
+            },
+        });
+        const response = await exportLgRun(fakeRequest({ headers: { 'x-user-id': 'u1' }, params: { id: 'run-1' } }));
+        expect(response.status).toBe(400);
+        const details = (response.jsonBody as { details: { branches: unknown[] } }).details;
+        expect(details.branches).toHaveLength(2);
+    });
+
+    it('returns 404 when no block matches the requested branch', async () => {
+        mockRunGet.mockResolvedValue({ id: 'run-1', reconciliation: { byBranch: [reconBlock] } });
+        const response = await exportLgRun(
+            fakeRequest({ headers: { 'x-user-id': 'u1' }, params: { id: 'run-1' }, query: { branch: '99' } })
+        );
+        expect(response.status).toBe(404);
+    });
+
+    it('streams the two-sheet workbook with download headers', async () => {
+        mockRunGet.mockResolvedValue({
+            id: 'run-1',
+            asOf: '2026-06-30',
+            reconciliation: { asOf: '2026-06-30', byBranch: [reconBlock] },
+        });
+        mockDetailQuery.mockResolvedValue([]);
+        const response = await exportLgRun(fakeRequest({ headers: { 'x-user-id': 'u1' }, params: { id: 'run-1' } }));
+        expect(response.status).toBe(200);
+        const headers = response.headers as Record<string, string>;
+        expect(headers['content-type']).toContain('spreadsheetml');
+        expect(headers['content-disposition']).toContain('GL-Recon_Branch-1_2026-06-30.xlsx');
+        expect((response.body as Uint8Array).byteLength).toBeGreaterThan(0);
     });
 });
 

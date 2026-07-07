@@ -264,7 +264,111 @@ export interface MatchSummary {
     netOutstandingFils: number;
     oldCount: number;
     currentCount: number;
-    byBranch: { branchNumber: string; outstandingCount: number; outstandingFils: number }[];
+    /** Cleared sets emitted by the engine (GOAL-2 G1). */
+    matchedSetCount: number;
+    /** Sets whose every leg was fully consumed (no partial residual). */
+    fullyClearedSetCount: number;
+    byBranch: {
+        branchNumber: string;
+        outstandingCount: number;
+        outstandingFils: number;
+        matchedSetCount: number;
+    }[];
+}
+
+// ---------- F6a: matched (cleared) sets (GOAL-2 G1) ----------
+
+/** One posting's participation in a matched set. */
+export interface MatchedLeg {
+    postDate: string;
+    direction: PostingDirection;
+    /** |amount| of the source posting, integer fils. */
+    originalFils: number;
+    /** Portion of this leg offset within this set, integer fils (≤ originalFils). */
+    matchedFils: number;
+    journalNumber: string;
+    sequence?: string;
+    logCode?: string;
+    /** Source data-row number (traceability, GOAL.md §5). */
+    rowNumber: number;
+    sheet?: string;
+}
+
+/**
+ * A cleared set: the connected component of debit↔credit offsets within one
+ * match-key group — how an instrument (or an account-FIFO chain, pending §9.2)
+ * actually cleared. Covers 1:1, 1:N and M:N uniformly. A set containing a
+ * partially-consumed leg is `fullyCleared: false`; the residual of that leg is a
+ * separate OutstandingItem, never netted silently.
+ */
+export interface MatchedSet {
+    entity: string;
+    gl: string;
+    branchNumber: string;
+    accountNumber?: string;
+    /** Σ offset fils inside this set (each offset counted once). */
+    matchedFils: number;
+    creditLegs: MatchedLeg[];
+    debitLegs: MatchedLeg[];
+    /** Earliest credit post date in the set. */
+    firstCreditDate: string;
+    /** Latest debit post date in the set. */
+    finalDebitDate: string;
+    /** finalDebitDate − firstCreditDate in days (negative when a debit pre-dates its credit). */
+    settledDays: number;
+    /** Every participating leg fully consumed — nothing from this set is outstanding. */
+    fullyCleared: boolean;
+}
+
+// ---------- F6b: reconciliation exceptions (GOAL-2 G2) ----------
+
+/** OutstandingReason plus the classified cases (GOAL.md §3: duplicate, amount mismatch). */
+export type LgExceptionReason = OutstandingReason | 'DUPLICATE' | 'AMOUNT_MISMATCH';
+
+/**
+ * A reconciling exception: every outstanding item becomes exactly one exception
+ * (exceptions ⊇ outstanding — nothing dropped), with the reason upgraded to
+ * DUPLICATE / AMOUNT_MISMATCH where the classifier finds those patterns.
+ */
+export interface LgException {
+    entity: string;
+    gl: string;
+    branchNumber: string;
+    accountNumber?: string;
+    postDate: string;
+    direction: PostingDirection;
+    /** |amount| of the source posting, integer fils. */
+    originalFils: number;
+    /** Still-unmatched |amount|, integer fils. */
+    outstandingFils: number;
+    logCode?: string;
+    journalNumber: string;
+    sequence?: string;
+    rowNumber: number;
+    sheet?: string;
+    ageBucket: AgeBucket;
+    reason: LgExceptionReason;
+    /** Human-readable finding for reviewers (GOAL.md §3 — displayed, never hidden). */
+    message: string;
+    /** Source rows of related postings (duplicate twins / mismatch counterpart). */
+    relatedRowNumbers?: number[];
+}
+
+export interface ExceptionSummary {
+    total: number;
+    byReason: Partial<Record<LgExceptionReason, number>>;
+}
+
+/**
+ * A chunk of per-run detail rows stored in the `lgRunDetails` container (GOAL-2
+ * G3/§8.3): matched sets and exceptions are too numerous for the run document
+ * (Cosmos 2MB), so they are chunked and paged. `seq` orders the chunks.
+ */
+export interface LgRunDetailChunk extends BaseDocument {
+    runId: string;
+    kind: 'matchedSets' | 'exceptions';
+    seq: number;
+    items: MatchedSet[] | LgException[];
 }
 
 // ---------- F5: reconciliation & Difference ----------
@@ -334,6 +438,11 @@ export interface LgRun extends BaseDocument {
     outstanding?: OutstandingItem[];
     /** F5: per-branch Difference / Balanced status derived from balances + outstanding. */
     reconciliation?: Reconciliation;
+    /** F6a: total cleared sets (the sets themselves live in `lgRunDetails`, capped). */
+    matchedSetCount?: number;
+    /** F6b: total exceptions (the items live in `lgRunDetails`, capped). */
+    exceptionCount?: number;
+    exceptionsSummary?: ExceptionSummary;
 }
 
 /** BHD (and the sample data) use 3 decimal places. */

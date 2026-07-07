@@ -1,0 +1,130 @@
+import * as ExcelJS from 'exceljs';
+import { computeBranchBalances } from '../../src/lg/balance';
+import { detectExceptions } from '../../src/lg/exceptions';
+import { buildStatementWorkbook, fmtBhd, fmtIsoDate, MISMATCHED_SHEET, STATEMENT_SHEET } from '../../src/lg/export';
+import { matchPostings } from '../../src/lg/match';
+import { reconcile } from '../../src/lg/reconcile';
+import { LgRun } from '../../src/shared/models';
+import { makePosting } from './helpers';
+
+const ASOF = '2026-06-30';
+
+/**
+ * Runs the full engine over crafted postings the way ingest does, so the export
+ * is asserted against the SAME stored figures the screen renders (ties exactly).
+ */
+function buildFixtureRun() {
+    const postings = [
+        // A fully cleared 1:1 pair — appears in matched sets, never on the statement.
+        makePosting({ amountBhdFils: -5_000_000, postDate: '2025-01-10', accountNumber: 'ACC-CLR' }),
+        makePosting({ amountBhdFils: 5_000_000, postDate: '2025-02-01', accountNumber: 'ACC-CLR' }),
+        // The unmatched debit (> 1 year old at the review date) — Section A.
+        makePosting({ amountBhdFils: 125_000, postDate: '2022-01-10', accountNumber: 'ACC-OLD', journalNumber: 'J-OLD' }),
+        // The unmatched credit (< 1 year) — Section B.
+        makePosting({ amountBhdFils: -78_500, postDate: '2026-02-10', accountNumber: 'ACC-CUR', journalNumber: 'J-CUR' }),
+    ];
+    const balances = computeBranchBalances(postings, ASOF);
+    const match = matchPostings(postings, { asOf: ASOF });
+    const reconciliation = reconcile(balances, match.outstanding, { asOf: ASOF });
+    const { exceptions } = detectExceptions(match.outstanding);
+    const run = {
+        id: 'run-golden',
+        asOf: ASOF,
+        reconciliation,
+        matching: match.summary,
+    } as unknown as LgRun;
+    return { run, recon: reconciliation.byBranch[0], exceptions };
+}
+
+async function loadWorkbook(buffer: Buffer): Promise<ExcelJS.Workbook> {
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(buffer as unknown as ExcelJS.Buffer);
+    return workbook;
+}
+
+describe('buildStatementWorkbook (G5) — golden-file layout', () => {
+    it('produces the two sheets of GOAL.md §2.3 with the reference layout and tying figures', async () => {
+        const { run, recon, exceptions } = buildFixtureRun();
+        const workbook = await loadWorkbook(await buildStatementWorkbook(run, recon, exceptions));
+
+        // Sheet names — statement first, mismatched second (§2.3).
+        expect(workbook.worksheets.map((w) => w.name)).toEqual([STATEMENT_SHEET, MISMATCHED_SHEET]);
+
+        const ws = workbook.getWorksheet(STATEMENT_SHEET)!;
+        // Title + identity block.
+        expect(ws.getCell('A1').value).toBe('GL Reconciliation — Outstanding Items Statement');
+        expect(ws.getCell('A2').value).toBe('Branch: 1');
+        expect(ws.getCell('A3').value).toBe('Entity: BH  ·  GL: D2810085  ·  Review Date: 30 Jun 2026');
+
+        // Reconciliation block — labels exactly as the reference sample (incl. the sic).
+        expect(ws.getCell('K2').value).toBe('GL Balance');
+        expect(ws.getCell('L2').value).toBe(fmtBhd(recon.glBalanceFils));
+        expect(ws.getCell('L2').value).toBe('46.500'); // 125.000 DR − 78.500 CR
+        expect(ws.getCell('K3').value).toBe('Total (OLD Item + MCQ)');
+        expect(ws.getCell('L3').value).toBe('203.500'); // 125.000 + 78.500 (Σ|outstanding|)
+        expect(ws.getCell('K4').value).toBe('Diffrence');
+        expect(ws.getCell('L4').value).toBe('0.000');
+        expect(ws.getCell('K5').value).toBe('Status');
+        expect(ws.getCell('L5').value).toBe('Balanced');
+
+        // Section A — Old Items.
+        expect(ws.getCell('A7').value).toBe("Old Items Outstanding – Old Manager's Checks");
+        expect(ws.getCell('A8').value).toBe('No.');
+        expect(ws.getCell('B8').value).toBe('Amount (BHD)');
+        expect(ws.getCell('F8').value).toBe('Date of Transfer to Old Items');
+        expect(ws.getCell('B9').value).toBe('125.000'); // the old unmatched debit
+        expect(ws.getCell('C9').value).toBe('10 Jan 2022');
+        expect(ws.getCell('H9').value).toBe('ACC-OLD');
+        expect(ws.getCell('A10').value).toBe('Subtotal');
+        expect(ws.getCell('B10').value).toBe(fmtBhd(recon.oldFils));
+
+        // Section B — current outstanding.
+        expect(ws.getCell('A12').value).toBe('Outstanding MCQ  (Less than 1 year)');
+        expect(ws.getCell('A13').value).toBe('No.');
+        expect(ws.getCell('B14').value).toBe('78.500'); // the current unmatched credit
+        expect(ws.getCell('A15').value).toBe('Subtotal');
+        expect(ws.getCell('B15').value).toBe(fmtBhd(recon.currentFils));
+    });
+
+    it('lists every exception on the Mismatched sheet — an unmatched debit is always there', async () => {
+        const { run, recon, exceptions } = buildFixtureRun();
+        const workbook = await loadWorkbook(await buildStatementWorkbook(run, recon, exceptions));
+        const ws = workbook.getWorksheet(MISMATCHED_SHEET)!;
+
+        expect(ws.getCell('A1').value).toBe('Reconciling Exceptions / Mismatched Items');
+        expect(ws.getCell('A2').value).toBe('ID');
+        expect(ws.getCell('I2').value).toBe('Reason / Required Action');
+
+        // Two exceptions → rows 3 and 4; the unmatched debit is surfaced with its reason.
+        const types = [ws.getCell('B3').value, ws.getCell('B4').value];
+        expect(types).toContain('Unmatched Debit');
+        expect(types).toContain('Unmatched Credit');
+        const debitRow = ws.getCell('B3').value === 'Unmatched Debit' ? 3 : 4;
+        expect(ws.getCell(`C${debitRow}`).value).toBe('DEBIT');
+        expect(ws.getCell(`D${debitRow}`).value).toBe('125.000');
+        expect(ws.getCell(`F${debitRow}`).value).toBe('J-OLD');
+        expect(String(ws.getCell(`I${debitRow}`).value)).toContain('no matching credit');
+        expect(ws.getCell('A5').value).toBeNull(); // exactly the two exceptions, nothing more
+    });
+
+    it('shows Not Balanced and the exact difference when the GL balance diverges', async () => {
+        const { run, recon, exceptions } = buildFixtureRun();
+        // Simulate an externally supplied balance 1 BHD off (GOAL.md §9.6).
+        const skewed = { ...recon, glBalanceFils: recon.glBalanceFils + 1000, differenceFils: 1000, balanced: false };
+        const workbook = await loadWorkbook(await buildStatementWorkbook(run, skewed, exceptions));
+        const ws = workbook.getWorksheet(STATEMENT_SHEET)!;
+
+        expect(ws.getCell('L4').value).toBe('1.000'); // never rounded away
+        expect(ws.getCell('L5').value).toBe('Not Balanced');
+    });
+
+    it('formats deterministically without locale APIs', () => {
+        expect(fmtBhd(72_501_861)).toBe('72,501.861');
+        expect(fmtBhd(-1_334_921)).toBe('-1,334.921');
+        expect(fmtBhd(555)).toBe('0.555');
+        expect(fmtBhd(0)).toBe('0.000');
+        expect(fmtIsoDate('2026-06-30')).toBe('30 Jun 2026');
+        expect(fmtIsoDate('2022-09-14')).toBe('14 Sep 2022');
+        expect(fmtIsoDate('not-a-date')).toBe('not-a-date');
+    });
+});
