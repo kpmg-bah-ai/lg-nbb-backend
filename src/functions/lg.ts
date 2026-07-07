@@ -16,7 +16,7 @@
  * handlers are hand-rolled and exported for test/lg/api.test.ts.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
 import { lgRunDetails, lgRuns } from '../data/repositories';
 import { recordAudit } from '../helpers/audit';
@@ -43,12 +43,63 @@ const MAX_STORED_BALANCES = 500;
 const DETAIL_CHUNK_SIZE = 250;
 
 /**
+ * Byte budget per chunk document. Cosmos rejects requests over 2MB ("Request size
+ * is too large"); item counts alone don't bound bytes because one matched set can
+ * carry very many legs, so chunks are ALSO split by serialized size.
+ */
+const DETAIL_CHUNK_MAX_BYTES = 1_500_000;
+
+/**
+ * Legs stored per side of a matched set. A busy sub-account FIFO-chains thousands
+ * of postings into one component — storing every leg would blow the document cap.
+ * `creditLegCount`/`debitLegCount` keep the true totals, so the cap is visible.
+ */
+const MAX_STORED_SET_LEGS = 50;
+
+/**
  * Ceiling on stored matched sets / exceptions per run (env-overridable). Totals are
  * always reported (`matchedSetCount` / `exceptionCount`), so truncation is visible,
  * never silent (GOAL-2 §6).
  */
 function maxStoredDetailItems(): number {
     return Number(process.env.LG_MAX_DETAIL_ITEMS) || 20_000;
+}
+
+/** Caps a set's stored legs; the leg counts on the set keep the true totals. */
+export function trimMatchedSet(set: MatchedSet): MatchedSet {
+    if (set.creditLegs.length <= MAX_STORED_SET_LEGS && set.debitLegs.length <= MAX_STORED_SET_LEGS) {
+        return set;
+    }
+    return {
+        ...set,
+        creditLegs: set.creditLegs.slice(0, MAX_STORED_SET_LEGS),
+        debitLegs: set.debitLegs.slice(0, MAX_STORED_SET_LEGS),
+    };
+}
+
+/** Splits items into chunks bounded by BOTH item count and serialized byte size. */
+export function buildDetailChunks<T>(
+    items: T[],
+    maxItems = DETAIL_CHUNK_SIZE,
+    maxBytes = DETAIL_CHUNK_MAX_BYTES
+): T[][] {
+    const chunks: T[][] = [];
+    let chunk: T[] = [];
+    let chunkBytes = 0;
+    for (const item of items) {
+        const itemBytes = Buffer.byteLength(JSON.stringify(item));
+        if (chunk.length > 0 && (chunk.length >= maxItems || chunkBytes + itemBytes > maxBytes)) {
+            chunks.push(chunk);
+            chunk = [];
+            chunkBytes = 0;
+        }
+        chunk.push(item);
+        chunkBytes += itemBytes;
+    }
+    if (chunk.length > 0) {
+        chunks.push(chunk);
+    }
+    return chunks;
 }
 
 /** Writes detail items as ordered chunk documents; returns how many items were stored. */
@@ -58,15 +109,12 @@ async function storeDetailChunks(
     items: MatchedSet[] | LgException[]
 ): Promise<number> {
     const capped = items.slice(0, maxStoredDetailItems());
-    for (let seq = 0; seq * DETAIL_CHUNK_SIZE < capped.length; seq++) {
-        await lgRunDetails.create({
-            runId,
-            kind,
-            seq,
-            items: capped.slice(seq * DETAIL_CHUNK_SIZE, (seq + 1) * DETAIL_CHUNK_SIZE),
-        });
+    const stored = kind === 'matchedSets' ? (capped as MatchedSet[]).map(trimMatchedSet) : capped;
+    const chunks = buildDetailChunks<MatchedSet | LgException>(stored);
+    for (let seq = 0; seq < chunks.length; seq++) {
+        await lgRunDetails.create({ runId, kind, seq, items: chunks[seq] as MatchedSet[] | LgException[] });
     }
-    return capped.length;
+    return stored.length;
 }
 
 /** Reads every stored detail item of one kind for a run, in chunk order. */
@@ -180,7 +228,20 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         parameters: [{ name: '@hash', value: inputSha256 }],
     });
 
+    // The run id is minted up front so the detail chunks can be written BEFORE the
+    // run document: if a chunk write fails, no half-ingested run becomes visible to
+    // clients (any already-written chunks reference a runId that no run document
+    // carries — inert leftovers, invisible to the by-run queries).
+    const runId = randomUUID();
+    // G3: matched sets + exceptions are chunked into lgRunDetails (capped, totals visible).
+    if (match && match.matchedSets.length > 0) {
+        await storeDetailChunks(runId, 'matchedSets', match.matchedSets);
+    }
+    if (exceptions && exceptions.exceptions.length > 0) {
+        await storeDetailChunks(runId, 'exceptions', exceptions.exceptions);
+    }
     const run = await lgRuns.create({
+        id: runId,
         filename,
         format,
         inputSha256,
@@ -200,13 +261,6 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         exceptionCount: exceptions ? exceptions.summary.total : 0,
         exceptionsSummary: exceptions?.summary,
     });
-    // G3: matched sets + exceptions are chunked into lgRunDetails (capped, totals visible).
-    if (match && match.matchedSets.length > 0) {
-        await storeDetailChunks(run.id, 'matchedSets', match.matchedSets);
-    }
-    if (exceptions && exceptions.exceptions.length > 0) {
-        await storeDetailChunks(run.id, 'exceptions', exceptions.exceptions);
-    }
     await recordAudit(user.id, 'lg.breakdown.ingested', 'lgRun', run.id, {
         filename,
         inputSha256,

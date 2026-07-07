@@ -68,7 +68,7 @@ beforeEach(() => {
     mockUserGet.mockResolvedValue(staffUser());
     mockRunCreate.mockImplementation(async (doc: Partial<LgRun>) => ({
         ...doc,
-        id: 'run-1',
+        id: doc.id ?? 'run-1',
         createdAt: '2026-07-01T00:00:00Z',
         updatedAt: '2026-07-01T00:00:00Z',
     }));
@@ -112,7 +112,7 @@ describe('POST lg/runs (F1 upload + F9 persistence + F10 auth)', () => {
         expect(run.summary.netFils).toBe(0);
         expect(run.errorCount).toBe(0);
         expect(mockAuditCreate).toHaveBeenCalledWith(
-            expect.objectContaining({ actor: 'u1', action: 'lg.breakdown.ingested', entityType: 'lgRun', entityId: 'run-1' })
+            expect.objectContaining({ actor: 'u1', action: 'lg.breakdown.ingested', entityType: 'lgRun', entityId: run.id })
         );
     });
 
@@ -314,8 +314,9 @@ describe('POST lg/runs — F6 detail storage (G2/G3)', () => {
         expect(run.matching!.matchedSetCount).toBe(run.matchedSetCount);
         // Fully balanced ⇒ nothing outstanding ⇒ zero exceptions, and no exception chunks.
         expect(run.exceptionCount).toBe(0);
+        // Chunks are written under the SAME id the run document is created with.
         expect(mockDetailCreate).toHaveBeenCalledWith(
-            expect.objectContaining({ runId: 'run-1', kind: 'matchedSets', seq: 0 })
+            expect.objectContaining({ runId: run.id, kind: 'matchedSets', seq: 0 })
         );
         expect(mockDetailCreate).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'exceptions' }));
     });
@@ -341,7 +342,7 @@ describe('POST lg/runs — F6 detail storage (G2/G3)', () => {
         expect(run.exceptionsSummary!.byReason.DUPLICATE).toBe(2);
         expect(run.exceptionsSummary!.byReason.AMOUNT_MISMATCH).toBe(2);
         expect(mockDetailCreate).toHaveBeenCalledWith(
-            expect.objectContaining({ runId: 'run-1', kind: 'exceptions', seq: 0 })
+            expect.objectContaining({ runId: run.id, kind: 'exceptions', seq: 0 })
         );
     });
 
@@ -368,6 +369,65 @@ describe('POST lg/runs — F6 detail storage (G2/G3)', () => {
             .map(([doc]) => doc as { kind: string; seq: number; items: unknown[] })
             .filter((doc) => doc.kind === 'exceptions');
         expect(exceptionChunks.map((c) => c.items.length)).toEqual([250, 50]);
+    });
+});
+
+describe('detail chunk sizing (Cosmos 2MB regression)', () => {
+    it('splits chunks by serialized byte size, not just item count', async () => {
+        const { buildDetailChunks } = await import('../../src/functions/lg');
+        // Four ~600KB items with a 1.5MB budget → 2 per chunk at most.
+        const fat = Array.from({ length: 4 }, (_, i) => ({ i, blob: 'x'.repeat(600_000) }));
+        const chunks = buildDetailChunks(fat as never[], 250, 1_500_000);
+        expect(chunks.map((c) => c.length)).toEqual([2, 2]);
+        // A single item over the budget still ships (alone) rather than looping forever.
+        const single = buildDetailChunks([{ blob: 'x'.repeat(2_000_000) }] as never[], 250, 1_500_000);
+        expect(single).toHaveLength(1);
+    });
+
+    it('still honours the item-count bound', async () => {
+        const { buildDetailChunks } = await import('../../src/functions/lg');
+        const chunks = buildDetailChunks(Array.from({ length: 501 }, (_, i) => ({ i })) as never[], 250, 1_500_000);
+        expect(chunks.map((c) => c.length)).toEqual([250, 250, 1]);
+    });
+
+    it('trims mega-set legs for storage while keeping the true counts visible', async () => {
+        const { trimMatchedSet } = await import('../../src/functions/lg');
+        const leg = (rowNumber: number) => ({
+            postDate: '2025-01-01', direction: 'debit' as const, originalFils: 1000, matchedFils: 1000,
+            journalNumber: `J${rowNumber}`, rowNumber,
+        });
+        const mega = {
+            entity: 'BH', gl: 'D2810085', branchNumber: '1', accountNumber: 'ACC-BUSY',
+            matchedFils: 120_000,
+            creditLegCount: 60, debitLegCount: 120,
+            creditLegs: Array.from({ length: 60 }, (_, i) => ({ ...leg(i), direction: 'credit' as const })),
+            debitLegs: Array.from({ length: 120 }, (_, i) => leg(1000 + i)),
+            firstCreditDate: '2025-01-01', finalDebitDate: '2025-02-01', settledDays: 31, fullyCleared: true,
+        };
+        const trimmed = trimMatchedSet(mega);
+        expect(trimmed.creditLegs).toHaveLength(50);
+        expect(trimmed.debitLegs).toHaveLength(50);
+        expect(trimmed.creditLegCount).toBe(60); // truncation stays visible
+        expect(trimmed.debitLegCount).toBe(120);
+        expect(trimmed.matchedFils).toBe(120_000); // figures untouched
+        // Small sets pass through unchanged (same reference — no copy churn).
+        const small = { ...mega, creditLegs: mega.creditLegs.slice(0, 2), debitLegs: mega.debitLegs.slice(0, 2) };
+        expect(trimMatchedSet(small)).toBe(small);
+    });
+
+    it('writes detail chunks BEFORE the run document so a chunk failure leaves no half-run', async () => {
+        mockDetailCreate.mockRejectedValueOnce(new Error('Request size is too large'));
+        await expect(
+            createLgRun(
+                fakeRequest({
+                    headers: { 'x-user-id': 'u1' },
+                    query: { filename: 'balanced-sample.csv' },
+                    body: fixture('balanced-sample.csv'),
+                })
+            )
+        ).rejects.toThrow('Request size is too large');
+        // The failure happened before lgRuns.create — no orphan run document.
+        expect(mockRunCreate).not.toHaveBeenCalled();
     });
 });
 

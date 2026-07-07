@@ -308,6 +308,13 @@ export interface MatchedSet {
     accountNumber?: string;
     /** Σ offset fils inside this set (each offset counted once). */
     matchedFils: number;
+    /**
+     * True leg totals. A busy account can FIFO-chain thousands of postings into one
+     * component, so stored `creditLegs`/`debitLegs` are capped (Cosmos 2MB) — counts
+     * greater than the stored array length mean visible truncation, never silent.
+     */
+    creditLegCount: number;
+    debitLegCount: number;
     creditLegs: MatchedLeg[];
     debitLegs: MatchedLeg[];
     /** Earliest credit post date in the set. */

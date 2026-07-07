@@ -219,6 +219,8 @@ export function matchPostings(postings: ParsedPosting[], options: MatchOptions =
                 branchNumber: participants[0].branchNumber,
                 accountNumber: accounts.size === 1 ? participants[0].accountNumber : undefined,
                 matchedFils: setFils,
+                creditLegCount: creditLegs.length,
+                debitLegCount: debitLegs.length,
                 creditLegs,
                 debitLegs,
                 firstCreditDate,
