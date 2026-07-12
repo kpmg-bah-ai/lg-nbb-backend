@@ -430,6 +430,7 @@ export function matchRegister(
                     : 'UNMATCHED_CREDIT',
             cheque: cheque ? toChequeAttributes(cheque) : undefined,
             batchRefs: batchRefsByDebit.get(idx),
+            reconciledNote: p.reconciledNote,
         });
     }
 

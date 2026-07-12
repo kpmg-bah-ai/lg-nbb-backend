@@ -358,6 +358,8 @@ export interface OutstandingItem {
     cheque?: ChequeAttributes;
     /** Register-family: `Ref.#` journals parsed from a batch debit's Detailed Description. */
     batchRefs?: string[];
+    /** Register-family: manual disposition from the Debit sheet's `reconciled` column. */
+    reconciledNote?: string;
 }
 
 export interface MatchSummary {
