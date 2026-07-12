@@ -49,6 +49,14 @@ export const EXC_TYPE_LABEL: Record<LgExceptionReason, string> = {
     PARTIALLY_MATCHED_CREDIT: 'Partially Matched Credit',
     DUPLICATE: 'Duplicate Posting',
     AMOUNT_MISMATCH: 'Amount Mismatch',
+    // GOAL-3 register family:
+    NON_ISSUANCE_CREDIT: 'Non-Issuance Credit',
+    UNRESOLVED_BATCH_DEBIT: 'Unresolved Batch Debit',
+    UNMATCHED_LEDGER_DEBIT: 'Unmatched Ledger Debit',
+    REGISTER_PAID_NO_LEDGER_DEBIT: 'Register Paid — No Ledger Debit',
+    REGISTER_LAG_OPS_PAID: 'Ops Paid — Register Lag',
+    KEY_COLLISION: 'Key Collision',
+    EXTRACT_GAP: 'Ledger Extract Gap',
 };
 
 export const STATEMENT_SHEET = 'MCQ+OLD ITEM';
