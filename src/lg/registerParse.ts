@@ -155,6 +155,8 @@ function isBlankRow(row: RawRow): boolean {
 export interface RegisterParseResult {
     cheques: RegisterCheque[];
     errors: ParseError[];
+    /** Non-blank data rows processed (parsed + row-error rows). */
+    dataRows: number;
 }
 
 /** Parses one register worksheet's raw rows (header + data) into RegisterCheques. */
@@ -172,6 +174,7 @@ export function parseRegisterSheet(rows: RawRow[], sheetName?: string): Register
                     message: 'No cheque-register header row found (need cheque no, amount, issued/matched journals)',
                 },
             ],
+            dataRows: 0,
         };
     }
     const columns = mapRegisterHeaders(rows[headerIndex])!;
@@ -253,5 +256,5 @@ export function parseRegisterSheet(rows: RawRow[], sheetName?: string): Register
         });
     }
 
-    return { cheques, errors };
+    return { cheques, errors, dataRows: rowNumber };
 }

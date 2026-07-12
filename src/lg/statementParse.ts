@@ -110,6 +110,8 @@ function isBlankRow(row: RawRow): boolean {
 export interface StatementParseResult {
     postings: ParsedPosting[];
     errors: ParseError[];
+    /** Non-blank data rows processed on this sheet (parsed + row-error rows). */
+    dataRows: number;
 }
 
 /**
@@ -131,6 +133,7 @@ export function parseStatementSheet(rows: RawRow[], sheetName?: string, rowOffse
                         'No ledger-statement header row found (need transaction date, journal number, branch and an amount column)',
                 },
             ],
+            dataRows: 0,
         };
     }
     const columns = mapStatementHeaders(rows[headerIndex])!;
@@ -243,5 +246,5 @@ export function parseStatementSheet(rows: RawRow[], sheetName?: string, rowOffse
         });
     }
 
-    return { postings, errors };
+    return { postings, errors, dataRows: rowNumber - rowOffset };
 }
