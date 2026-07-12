@@ -190,3 +190,77 @@ describe('parseRegisterSheet', () => {
         expect(cheques.reduce((s, c) => s + c.amountFils, 0)).toBe(2700750); // Σ register amounts
     });
 });
+
+/**
+ * Wrong-value tracking: non-empty cells that fail their column's format are
+ * saved (raw value + column) on the error. Wrong dates in the register's
+ * non-key columns no longer vanish silently — the cheque still parses and the
+ * wrongness is tracked with rowParsed. Sentinels are markers, never "wrong".
+ */
+describe('wrong-value tracking', () => {
+    test('a wrong amount saves the raw value and column (the cheque cannot parse)', () => {
+        const { cheques, errors } = parseRegisterSheet([HEADERS, row({ c9_amount: 'oops' })], 'Sheet1');
+        expect(cheques).toHaveLength(0);
+        expect(errors).toContainEqual(
+            expect.objectContaining({ code: 'BAD_AMOUNT', value: 'oops', column: 'D', columnHeader: 'c9_amount' })
+        );
+    });
+
+    test('an ops-date typo is tracked with value+column and the cheque still parses', () => {
+        const { cheques, errors } = parseRegisterSheet(
+            [HEADERS, row({ 'Ops Remark': 'PAID', 'Ops Date': '09//04/2024' })],
+            'Sheet1'
+        );
+        expect(cheques).toHaveLength(1);
+        expect(cheques[0].opsDate).toBeUndefined();
+        expect(errors).toContainEqual(
+            expect.objectContaining({
+                code: 'BAD_DATE',
+                value: '09//04/2024',
+                column: 'I',
+                columnHeader: 'Ops Date',
+                rowParsed: true,
+            })
+        );
+    });
+
+    test('garbage in the issued/matched/cancel date columns is tracked, not silently dropped', () => {
+        const { cheques, errors } = parseRegisterSheet(
+            [HEADERS, row({ c16_issued_date: 'garbage', c25_matchd_post_dt: '??', c31_cncld_date: 'x1' })],
+            'Sheet1'
+        );
+        expect(cheques).toHaveLength(1);
+        expect(cheques[0].issuedDate).toBeUndefined();
+        expect(cheques[0].matchedPostDate).toBeUndefined();
+        expect(cheques[0].cancelDate).toBeUndefined();
+        expect(errors).toContainEqual(
+            expect.objectContaining({ code: 'BAD_DATE', value: 'garbage', column: 'K', columnHeader: 'c16_issued_date', rowParsed: true })
+        );
+        expect(errors).toContainEqual(
+            expect.objectContaining({ code: 'BAD_DATE', value: '??', column: 'N', columnHeader: 'c25_matchd_post_dt', rowParsed: true })
+        );
+        expect(errors).toContainEqual(
+            expect.objectContaining({ code: 'BAD_DATE', value: 'x1', column: 'Q', columnHeader: 'c31_cncld_date', rowParsed: true })
+        );
+    });
+
+    test('the never-paid sentinels are NOT wrong values', () => {
+        const { cheques, errors } = parseRegisterSheet(
+            [HEADERS, row({ c25_matchd_post_dt: new Date('1901-01-01T00:00:00Z'), c27_matchd_jrnl_no: 0 })],
+            'Sheet1'
+        );
+        expect(cheques).toHaveLength(1);
+        expect(cheques[0].matchedPostDate).toBeUndefined();
+        expect(cheques[0].matchedJournal).toBeUndefined();
+        expect(errors).toHaveLength(0);
+    });
+
+    test('empty optional date cells are missing, not wrong — no tracking entries', () => {
+        const { cheques, errors } = parseRegisterSheet(
+            [HEADERS, row({ c16_issued_date: null, c25_matchd_post_dt: '', c31_cncld_date: '   ' })],
+            'Sheet1'
+        );
+        expect(cheques).toHaveLength(1);
+        expect(errors).toHaveLength(0);
+    });
+});

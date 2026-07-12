@@ -14,7 +14,7 @@
  */
 
 import { filsToBhd, ParsedPosting, ParseError, RawCell, RawRow } from '../shared/models';
-import { coerceDate, extractLogCode, normalizeHeader, parseAmountToFils } from './parse';
+import { cellTrack, coerceDate, excelColumn, extractLogCode, normalizeHeader, parseAmountToFils, rawCellText } from './parse';
 
 type StatementField =
     | 'transactionDate'
@@ -136,7 +136,8 @@ export function parseStatementSheet(rows: RawRow[], sheetName?: string, rowOffse
             dataRows: 0,
         };
     }
-    const columns = mapStatementHeaders(rows[headerIndex])!;
+    const header = rows[headerIndex];
+    const columns = mapStatementHeaders(header)!;
     const cell = (row: RawRow, field: StatementField): RawCell => {
         const idx = columns[field];
         return idx === undefined ? undefined : row[idx];
@@ -159,17 +160,18 @@ export function parseStatementSheet(rows: RawRow[], sheetName?: string, rowOffse
                 row: rowNumber,
                 sheet: sheetName,
                 message: 'Transaction Date is missing or not a valid date',
+                ...cellTrack(header, columns.transactionDate, cell(row, 'transactionDate')),
             });
         }
 
         const gl = str(cell(row, 'gl'));
         const branchNumber = str(cell(row, 'branch'));
         const journalNumber = str(cell(row, 'journalNumber'));
-        for (const [field, value] of [
-            ['gl', gl],
-            ['branchNumber', branchNumber],
-            ['journalNumber', journalNumber],
-        ] as ['gl' | 'branchNumber' | 'journalNumber', string | undefined][]) {
+        for (const [field, column, value] of [
+            ['gl', 'gl', gl],
+            ['branchNumber', 'branch', branchNumber],
+            ['journalNumber', 'journalNumber', journalNumber],
+        ] as ['gl' | 'branchNumber' | 'journalNumber', StatementField, string | undefined][]) {
             if (value === undefined) {
                 rowErrors.push({
                     code: 'MISSING_FIELD',
@@ -177,24 +179,31 @@ export function parseStatementSheet(rows: RawRow[], sheetName?: string, rowOffse
                     row: rowNumber,
                     sheet: sheetName,
                     message: `Required value "${field}" is empty`,
+                    ...cellTrack(header, columns[column], cell(row, column)),
                 });
             }
         }
 
         // Direction per row: exactly one non-zero amount column (GOAL-3 §4.2).
-        const creditFils = parseAmountToFils(cell(row, 'creditAmount'));
-        const debitFils = parseAmountToFils(cell(row, 'debitAmount'));
+        const creditRaw = cell(row, 'creditAmount');
+        const debitRaw = cell(row, 'debitAmount');
+        const creditFils = parseAmountToFils(creditRaw);
+        const debitFils = parseAmountToFils(debitRaw);
         const hasCredit = creditFils !== undefined && creditFils !== 0;
         const hasDebit = debitFils !== undefined && debitFils !== 0;
         let amountBhdFils: number | undefined;
         let direction: 'debit' | 'credit' | undefined;
         if (hasCredit && hasDebit) {
+            const cols = [columns.creditAmount, columns.debitAmount].filter((c): c is number => c !== undefined);
             rowErrors.push({
                 code: 'AMBIGUOUS_DIRECTION',
                 field: 'amountBhd',
                 row: rowNumber,
                 sheet: sheetName,
                 message: 'Both the credit and debit amount columns are populated — cannot classify the row',
+                value: `${rawCellText(creditRaw)} / ${rawCellText(debitRaw)}`,
+                column: cols.map(excelColumn).join('/'),
+                columnHeader: cols.map((c) => rawCellText(header[c]) ?? '').join(' / '),
             });
         } else if (hasCredit) {
             direction = 'credit';
@@ -203,26 +212,66 @@ export function parseStatementSheet(rows: RawRow[], sheetName?: string, rowOffse
             direction = 'debit';
             amountBhdFils = Math.abs(debitFils); // debits are held negative in the file
         } else {
+            // Point the error at whichever cell actually holds content (wrong
+            // text or a zero); when both are empty the amounts are missing,
+            // not wrong, and there is no cell to track.
+            const offending = rawCellText(creditRaw) !== undefined ? ('creditAmount' as const) : rawCellText(debitRaw) !== undefined ? ('debitAmount' as const) : undefined;
             rowErrors.push({
                 code: 'BAD_AMOUNT',
                 field: 'amountBhd',
                 row: rowNumber,
                 sheet: sheetName,
                 message: 'Neither amount column carries a non-zero value',
+                ...(offending ? cellTrack(header, columns[offending], cell(row, offending)) : {}),
             });
         }
 
+        // Wrong values in the non-key columns: the row still parses; the wrong
+        // cell is tracked with its raw value + column. Empty cells are missing,
+        // not wrong — no tracking entry.
+        const tracked: ParseError[] = [];
+        const trackWrong = (field: StatementField, code: 'BAD_DATE' | 'BAD_AMOUNT', what: string): void => {
+            const raw = cell(row, field);
+            if (rawCellText(raw) !== undefined) {
+                tracked.push({
+                    code,
+                    field,
+                    row: rowNumber,
+                    sheet: sheetName,
+                    message: `${what} — row kept, wrong value tracked`,
+                    ...cellTrack(header, columns[field], raw),
+                });
+            }
+        };
+        const postingDate = coerceDate(cell(row, 'postingDate'));
+        if (postingDate === undefined) {
+            trackWrong('postingDate', 'BAD_DATE', 'Posting Date is not a valid date (row kept on the transaction date)');
+        }
+        const statedEodFils = parseAmountToFils(cell(row, 'statedEod'));
+        if (statedEodFils === undefined) {
+            trackWrong('statedEod', 'BAD_AMOUNT', 'End Date EoD Balance is not a number');
+        }
+        const statedPrevEodFils = parseAmountToFils(cell(row, 'statedPrev'));
+        if (statedPrevEodFils === undefined) {
+            trackWrong('statedPrev', 'BAD_AMOUNT', 'Previous EoD Balance is not a number');
+        }
+
         if (rowErrors.length > 0 || !gl || !branchNumber || !journalNumber || !transactionDate || !direction) {
-            errors.push(...rowErrors);
+            // Row excluded by a critical error: keep the tracking, without rowParsed.
+            errors.push(...rowErrors, ...tracked);
             continue;
         }
+        for (const t of tracked) {
+            t.rowParsed = true;
+        }
+        errors.push(...tracked);
 
         const description = str(cell(row, 'description')) ?? '';
         postings.push({
             entity: '', // no entity column in this layout (GOAL-3 §2.4 default)
             branchNumber,
             gl,
-            postDate: coerceDate(cell(row, 'postingDate')) ?? transactionDate,
+            postDate: postingDate ?? transactionDate,
             logDescription: description,
             logCode: extractLogCode(description),
             currency: 'BHD', // no currency column — default (GOAL-3 §2.5)
@@ -240,8 +289,8 @@ export function parseStatementSheet(rows: RawRow[], sheetName?: string, rowOffse
             teller: str(cell(row, 'teller')),
             accountName: str(cell(row, 'accountName')),
             detailedDescription: str(cell(row, 'detailedDescription')),
-            statedEodFils: parseAmountToFils(cell(row, 'statedEod')),
-            statedPrevEodFils: parseAmountToFils(cell(row, 'statedPrev')),
+            statedEodFils,
+            statedPrevEodFils,
             reconciledNote: str(cell(row, 'reconciled')),
         });
     }

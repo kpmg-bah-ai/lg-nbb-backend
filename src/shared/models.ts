@@ -280,9 +280,26 @@ export interface ParseError {
     message: string;
     /** 1-based data-row number; omitted for file/header-level problems. */
     row?: number;
-    field?: CanonicalField;
+    /** Source field the problem relates to (canonical breakdown fields, or register/statement field names). */
+    field?: string;
     /** Worksheet the problem relates to (multi-sheet workbooks). */
     sheet?: string;
+    /**
+     * Raw content of the wrong cell (trimmed, capped) — present only when a
+     * NON-EMPTY value failed its column's declared format. Empty cells are
+     * missing, never "wrong", and carry no value.
+     */
+    value?: string;
+    /** Spreadsheet column the wrong value sat in, as the Excel letter (e.g. 'K'). */
+    column?: string;
+    /** That column's header text as written in the source file. */
+    columnHeader?: string;
+    /**
+     * True when the row STILL parsed into a posting/cheque and the wrong value
+     * was only set aside — tracking, not exclusion. Absent when the problem
+     * excluded the row (or is file/header-level).
+     */
+    rowParsed?: boolean;
 }
 
 export interface ParseSummary {

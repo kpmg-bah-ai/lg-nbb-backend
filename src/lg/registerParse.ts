@@ -13,7 +13,7 @@
  */
 
 import { ParseError, RawCell, RawRow, RegisterCheque } from '../shared/models';
-import { coerceDate, normalizeHeader, parseAmountToFils } from './parse';
+import { cellTrack, coerceDate, normalizeHeader, parseAmountToFils, rawCellText } from './parse';
 
 type RegisterField =
     | 'etlDate'
@@ -180,7 +180,8 @@ export function parseRegisterSheet(rows: RawRow[], sheetName?: string): Register
             dataRows: 0,
         };
     }
-    const columns = mapRegisterHeaders(rows[headerIndex])!;
+    const header = rows[headerIndex];
+    const columns = mapRegisterHeaders(header)!;
     const cell = (row: RawRow, field: RegisterField): RawCell => {
         const idx = columns[field];
         return idx === undefined ? undefined : row[idx];
@@ -194,19 +195,43 @@ export function parseRegisterSheet(rows: RawRow[], sheetName?: string): Register
         }
         rowNumber++;
 
-        const amountFils = parseAmountToFils(cell(row, 'amount'));
+        const amountRaw = cell(row, 'amount');
+        const amountFils = parseAmountToFils(amountRaw);
         if (amountFils === undefined) {
             errors.push({
                 code: 'BAD_AMOUNT',
+                field: 'amount',
                 row: rowNumber,
                 sheet: sheetName,
                 message: 'Register cheque amount (c9_amount) is missing or not a number',
+                ...cellTrack(header, columns.amount, amountRaw),
             });
             continue;
         }
 
+        // Wrong values in the register's date columns: the cheque still parses;
+        // the wrong cell is tracked with its raw value + column (rowParsed).
+        // An empty cell is missing, not wrong — no tracking entry.
+        const tracked: ParseError[] = [];
+        const trackedDate = (field: RegisterField, label: string): string | undefined => {
+            const raw = cell(row, field);
+            const parsed = coerceDate(raw);
+            if (parsed === undefined && rawCellText(raw) !== undefined) {
+                tracked.push({
+                    code: 'BAD_DATE',
+                    field,
+                    row: rowNumber,
+                    sheet: sheetName,
+                    rowParsed: true,
+                    message: `${label} is not a valid date — cheque kept, wrong value tracked`,
+                    ...cellTrack(header, columns[field], raw),
+                });
+            }
+            return parsed;
+        };
+
         // Payment key leg with "never paid" sentinels collapsed to undefined.
-        let matchedPostDate = coerceDate(cell(row, 'matchedPostDate'));
+        let matchedPostDate = trackedDate('matchedPostDate', 'Matched post date (c25_matchd_post_dt)');
         let matchedJournal = str(cell(row, 'matchedJournal'));
         if (matchedPostDate === SENTINEL_MATCHED_DATE) {
             matchedPostDate = undefined;
@@ -221,32 +246,39 @@ export function parseRegisterSheet(rows: RawRow[], sheetName?: string): Register
         if (opsDateRaw !== null && opsDateRaw !== undefined && String(opsDateRaw).trim() !== '') {
             opsDate = typeof opsDateRaw === 'string' ? parseDmyDate(opsDateRaw) : coerceDate(opsDateRaw);
             if (opsDate === undefined) {
-                errors.push({
+                tracked.push({
                     code: 'BAD_DATE',
+                    field: 'opsDate',
                     row: rowNumber,
                     sheet: sheetName,
+                    rowParsed: true,
                     message: `Ops Date "${String(opsDateRaw).trim()}" is not a valid dd/mm/yyyy date`,
+                    ...cellTrack(header, columns.opsDate, opsDateRaw),
                 });
             }
         }
 
         const opsRemark = cleanText(cell(row, 'opsRemark'));
         const currencyRaw = cleanText(cell(row, 'currency'));
+        const issuedDate = trackedDate('issuedDate', 'Issued date (c16_issued_date)');
+        const issuedPostDate = trackedDate('issuedPostDate', 'Issued post date (c17_issued_post_dt)');
+        const cancelDate = trackedDate('cancelDate', 'Cancelled date (c31_cncld_date)');
 
+        errors.push(...tracked);
         cheques.push({
             instrument: str(cell(row, 'instrument')),
             chequeNumber: str(cell(row, 'chequeNumber')),
             amountFils,
             payee: cleanText(cell(row, 'payee')),
             status: statusText(cell(row, 'status')),
-            issuedDate: coerceDate(cell(row, 'issuedDate')),
-            issuedPostDate: coerceDate(cell(row, 'issuedPostDate')),
+            issuedDate,
+            issuedPostDate,
             issuedBranch: str(cell(row, 'issuedBranch')),
             issuedJournal: str(cell(row, 'issuedJournal')),
             matchedPostDate,
             matchedJournal,
             stopReason: str(cell(row, 'stopReason')),
-            cancelDate: coerceDate(cell(row, 'cancelDate')),
+            cancelDate,
             purchaser: cleanText(cell(row, 'purchaser')),
             beneficiary: cleanText(cell(row, 'beneficiary')),
             currency: currencyRaw ? CURRENCY_CODE_MAP[currencyRaw] ?? currencyRaw : undefined,

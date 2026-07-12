@@ -195,3 +195,77 @@ describe('parseStatementSheet', () => {
         expect(STATEMENT_GL_ALIAS).toBe('nostro/bglaccount');
     });
 });
+
+/**
+ * Wrong-value tracking: non-empty cells that fail their column's format are
+ * saved (raw value + column) on the error. Wrong values in the non-key columns
+ * (posting date, stated balances) no longer degrade silently — the row still
+ * parses and the wrongness is tracked with rowParsed.
+ */
+describe('wrong-value tracking', () => {
+    test('a wrong Transaction Date saves value+column (row cannot join matching)', () => {
+        const { postings, errors } = parseStatementSheet([HEADERS, row({ 'Transaction Date': 'JNL 123' })], 'Credit');
+        expect(postings).toHaveLength(0);
+        expect(errors).toContainEqual(
+            expect.objectContaining({ code: 'BAD_DATE', value: 'JNL 123', column: 'A', columnHeader: 'Transaction Date' })
+        );
+    });
+
+    test('a wrong Posting Date is tracked and the row still parses on the transaction date', () => {
+        const { postings, errors } = parseStatementSheet([HEADERS, row({ 'Posting Date': '31/02/2025x' })], 'Credit');
+        expect(postings).toHaveLength(1);
+        expect(postings[0].postDate).toBe('2025-03-10'); // fallback to the transaction date
+        expect(errors).toContainEqual(
+            expect.objectContaining({
+                code: 'BAD_DATE',
+                value: '31/02/2025x',
+                column: 'B',
+                columnHeader: 'Posting Date',
+                rowParsed: true,
+            })
+        );
+    });
+
+    test('wrong stated-balance cells are tracked and the row still parses', () => {
+        const { postings, errors } = parseStatementSheet(
+            [HEADERS, row({ 'End Date EoD Balance': 'abc', 'Previous EoD Balance': 'de' })],
+            'Credit'
+        );
+        expect(postings).toHaveLength(1);
+        expect(postings[0].statedEodFils).toBeUndefined();
+        expect(postings[0].statedPrevEodFils).toBeUndefined();
+        expect(errors).toContainEqual(
+            expect.objectContaining({ code: 'BAD_AMOUNT', value: 'abc', column: 'P', rowParsed: true })
+        );
+        expect(errors).toContainEqual(
+            expect.objectContaining({ code: 'BAD_AMOUNT', value: 'de', column: 'Q', rowParsed: true })
+        );
+    });
+
+    test('non-numeric text in an amount column is the saved wrong value on BAD_AMOUNT', () => {
+        const { postings, errors } = parseStatementSheet([HEADERS, row({ 'Transaction Credit Amount': 'n/a' })], 'Credit');
+        expect(postings).toHaveLength(0);
+        expect(errors).toContainEqual(
+            expect.objectContaining({ code: 'BAD_AMOUNT', value: 'n/a', column: 'K', columnHeader: 'Transaction Credit Amount' })
+        );
+    });
+
+    test('AMBIGUOUS_DIRECTION saves both populated amounts and both columns', () => {
+        const { errors } = parseStatementSheet(
+            [HEADERS, row({ 'Transaction Credit Amount': 100, 'Transaction Debit Amount': -100 })],
+            'Credit'
+        );
+        expect(errors).toContainEqual(
+            expect.objectContaining({ code: 'AMBIGUOUS_DIRECTION', value: '100 / -100', column: 'K/L' })
+        );
+    });
+
+    test('empty stated-balance cells are missing, not wrong — no tracking entries', () => {
+        const { postings, errors } = parseStatementSheet(
+            [HEADERS, row({ 'End Date EoD Balance': null, 'Previous EoD Balance': '' })],
+            'Credit'
+        );
+        expect(postings).toHaveLength(1);
+        expect(errors).toHaveLength(0);
+    });
+});
