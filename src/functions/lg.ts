@@ -2,10 +2,11 @@
  * LG reconciliation — HTTP surface for the ingest pipeline (GOAL.md §4 F1/F9/F10,
  * GOAL-2 G3/G5).
  *
- *   POST /api/lg/runs                 — upload a transaction breakdown (multipart "file"
- *                                       field, or the raw bytes with ?filename=…); parses
- *                                       it and stores the run. Header/file-level failures
- *                                       come back as 422.
+ *   POST /api/lg/runs                 — upload a transaction breakdown (one or more
+ *                                       multipart "file" fields — multiple files pool
+ *                                       into ONE combined run — or the raw bytes with
+ *                                       ?filename=…); parses it and stores the run.
+ *                                       Header/file-level failures come back as 422.
  *   GET  /api/lg/runs                 — list stored runs (paged).
  *   GET  /api/lg/runs/{id}            — one run with its summary and (capped) errors.
  *   GET  /api/lg/runs/{id}/matched    — the run's cleared sets (offset-paged, G3).
@@ -25,7 +26,7 @@ import { badRequest, created, error, json, notFound } from '../helpers/json';
 import { computeBranchBalances, deriveAsOf } from '../lg/balance';
 import { detectExceptions } from '../lg/exceptions';
 import { buildStatementWorkbook } from '../lg/export';
-import { detectFormat, ingest } from '../lg/ingest';
+import { detectFormat, ingestFiles } from '../lg/ingest';
 import { matchPostings } from '../lg/match';
 import { reconcile } from '../lg/reconcile';
 import { classifyRegisterExceptions } from '../lg/registerExceptions';
@@ -38,6 +39,7 @@ import {
     LgException,
     LgRun,
     LgRunDetailChunk,
+    LgRunFile,
     MatchedSet,
     MatchSummary,
     OutstandingItem,
@@ -183,21 +185,29 @@ interface Upload {
     filename?: string;
 }
 
-/** Accepts either multipart form-data (a "file" field) or the raw file bytes as the body. */
-async function readUpload(request: HttpRequest): Promise<Upload> {
+/**
+ * Accepts multipart form-data (one or MORE "file" fields — a multi-file upload
+ * becomes one combined run) or the raw file bytes as the body (single file).
+ */
+async function readUpload(request: HttpRequest): Promise<Upload[]> {
     const contentType = request.headers.get('content-type') ?? '';
     if (contentType.includes('multipart/form-data')) {
         const form = await request.formData();
-        const file = form.get('file');
-        if (!file || typeof file === 'string') {
-            return { buffer: Buffer.alloc(0) };
+        const uploads: Upload[] = [];
+        for (const entry of form.getAll('file')) {
+            if (typeof entry === 'string') {
+                continue; // a text field named "file" is not an upload
+            }
+            uploads.push({ buffer: Buffer.from(await entry.arrayBuffer()), filename: entry.name || undefined });
         }
-        return { buffer: Buffer.from(await file.arrayBuffer()), filename: file.name || undefined };
+        return uploads;
     }
-    return {
-        buffer: Buffer.from(await request.arrayBuffer()),
-        filename: request.query.get('filename') ?? undefined,
-    };
+    return [
+        {
+            buffer: Buffer.from(await request.arrayBuffer()),
+            filename: request.query.get('filename') ?? undefined,
+        },
+    ];
 }
 
 export async function createLgRun(request: HttpRequest): Promise<HttpResponseInit> {
@@ -209,23 +219,36 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
     if (asOfParam && !isIsoDate(asOfParam)) {
         return badRequest('asOf must be a valid ISO date (yyyy-mm-dd)');
     }
-    let upload: Upload;
+    let uploads: Upload[];
     try {
-        upload = await readUpload(request);
+        uploads = await readUpload(request);
     } catch {
         return badRequest('The request body could not be read — check the multipart encoding');
     }
-    const { buffer, filename } = upload;
-    if (buffer.length === 0) {
+    if (uploads.length === 0 || uploads.every((u) => u.buffer.length === 0)) {
         return badRequest(
-            'Send the breakdown as a multipart "file" field or as the raw request body (with ?filename=…)'
+            'Send the breakdown as one or more multipart "file" fields or as the raw request body (with ?filename=…)'
         );
     }
-    if (buffer.length > maxUploadBytes()) {
-        return error(413, `The file exceeds the ${Math.floor(maxUploadBytes() / (1024 * 1024))}MB upload limit`);
+    const empty = uploads.find((u) => u.buffer.length === 0);
+    if (empty) {
+        return badRequest(`The uploaded file "${empty.filename ?? '(unnamed)'}" is empty`);
     }
-    const format = detectFormat(buffer, filename);
-    const result = await ingest(buffer, { filename, format });
+    const totalBytes = uploads.reduce((sum, u) => sum + u.buffer.length, 0);
+    if (totalBytes > maxUploadBytes()) {
+        return error(413, `The upload exceeds the ${Math.floor(maxUploadBytes() / (1024 * 1024))}MB limit`);
+    }
+    // Per-file identity, kept on the run for provenance when there is more than one file.
+    const files: LgRunFile[] = uploads.map((u) => ({
+        filename: u.filename,
+        format: detectFormat(u.buffer, u.filename),
+        sha256: createHash('sha256').update(u.buffer).digest('hex'),
+        bytes: u.buffer.length,
+    }));
+    const filename =
+        uploads.length === 1 ? uploads[0].filename : files.map((f) => f.filename ?? '(unnamed)').join(' + ');
+    const format = files[0].format;
+    const result = await ingestFiles(uploads.map((u) => ({ buffer: u.buffer, filename: u.filename })));
     // Header/file-level problems mean no rows were mapped — reject rather than store an empty run (F1).
     if (result.errors.some((e) => REJECT_CODES.has(e.code))) {
         return error(422, 'The file is not a recognisable transaction breakdown', { errors: result.errors });
@@ -277,7 +300,20 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         }
     }
 
-    const inputSha256 = createHash('sha256').update(buffer).digest('hex');
+    // Input identity (GOAL.md §5 determinism). Single file: hash of the raw bytes,
+    // unchanged from pre-multi-file runs. Multi-file: hash of the SORTED per-file
+    // hashes, so the same set of files dedupes regardless of upload order.
+    const inputSha256 =
+        uploads.length === 1
+            ? files[0].sha256
+            : createHash('sha256')
+                  .update(
+                      files
+                          .map((f) => f.sha256)
+                          .sort()
+                          .join('')
+                  )
+                  .digest('hex');
     // Same-input detection (GOAL.md §5 re-runnability): link, but still store the re-run.
     const duplicates = await lgRuns.query<{ id: string }>({
         query: 'SELECT c.id FROM c WHERE c.inputSha256 = @hash ORDER BY c.createdAt ASC',
@@ -305,6 +341,9 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         filename,
         format,
         inputSha256,
+        // Per-file provenance only for multi-file uploads — single-file run docs
+        // keep their historic shape.
+        ...(uploads.length > 1 ? { files } : {}),
         duplicateOf: duplicates[0]?.id,
         uploadedBy: user.id,
         mode: result.mode,
@@ -325,6 +364,7 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
     });
     await recordAudit(user.id, 'lg.breakdown.ingested', 'lgRun', run.id, {
         filename,
+        fileCount: uploads.length,
         inputSha256,
         mode: result.mode,
         dataRows: result.summary.dataRows,

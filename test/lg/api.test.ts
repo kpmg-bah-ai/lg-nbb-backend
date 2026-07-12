@@ -131,6 +131,107 @@ describe('POST lg/runs (F1 upload + F9 persistence + F10 auth)', () => {
         expect(run.format).toBe('xlsx');
         expect(run.filename).toBe('balanced-sample.xlsx');
         expect(run.summary.parsed).toBe(6);
+        // Single-file runs keep the historic doc shape — no files[] block.
+        expect(run.files).toBeUndefined();
+    });
+
+    it('pools multiple multipart "file" fields into one combined run with per-file provenance', async () => {
+        const form = new FormData();
+        form.append('file', new File([fixture('balanced-sample.xlsx')], 'balanced-sample.xlsx'));
+        form.append('file', new File([fixture('unbalanced-sample.xlsx')], 'unbalanced-sample.xlsx'));
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1', 'content-type': 'multipart/form-data; boundary=test' },
+                form,
+            })
+        );
+        expect(response.status).toBe(201);
+        const run = response.jsonBody as LgRun;
+        expect(run.summary.parsed).toBe(9); // 6 balanced + 3 unbalanced postings in ONE run
+        expect(run.summary.netFils).toBe(5590614);
+        expect(run.filename).toBe('balanced-sample.xlsx + unbalanced-sample.xlsx');
+        expect(run.files).toHaveLength(2);
+        expect(run.files![0]).toMatchObject({ filename: 'balanced-sample.xlsx', format: 'xlsx' });
+        expect(run.files![1]).toMatchObject({ filename: 'unbalanced-sample.xlsx', format: 'xlsx' });
+        expect(run.files![0].sha256).toMatch(/^[0-9a-f]{64}$/);
+        expect(run.files![0].bytes).toBeGreaterThan(0);
+        expect(mockAuditCreate).toHaveBeenCalledWith(expect.objectContaining({ details: expect.objectContaining({ fileCount: 2 }) }));
+    });
+
+    it('computes the same inputSha256 regardless of file order (set-level dedupe)', async () => {
+        const upload = async (names: string[]) => {
+            const form = new FormData();
+            for (const name of names) {
+                form.append('file', new File([fixture(name)], name));
+            }
+            const response = await createLgRun(
+                fakeRequest({
+                    headers: { 'x-user-id': 'u1', 'content-type': 'multipart/form-data; boundary=test' },
+                    form,
+                })
+            );
+            expect(response.status).toBe(201);
+            return (response.jsonBody as LgRun).inputSha256;
+        };
+        const hashAB = await upload(['balanced-sample.xlsx', 'unbalanced-sample.xlsx']);
+        const hashBA = await upload(['unbalanced-sample.xlsx', 'balanced-sample.xlsx']);
+        expect(hashAB).toMatch(/^[0-9a-f]{64}$/);
+        expect(hashBA).toBe(hashAB);
+    });
+
+    it('rejects a multi-file upload whose combined size exceeds the cap with 413', async () => {
+        const single = fixture('balanced-sample.xlsx');
+        process.env.LG_MAX_UPLOAD_BYTES = String(single.length + 10); // one fits, two do not
+        const form = new FormData();
+        form.append('file', new File([single], 'a.xlsx'));
+        form.append('file', new File([single], 'b.xlsx'));
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1', 'content-type': 'multipart/form-data; boundary=test' },
+                form,
+            })
+        );
+        expect(response.status).toBe(413);
+        expect(mockRunCreate).not.toHaveBeenCalled();
+    });
+
+    it('accepts a register family split across two files', async () => {
+        const ExcelJS = await import('exceljs');
+        const workbookBuffer = async (sheets: { name: string; rows: unknown[][] }[]) => {
+            const workbook = new ExcelJS.Workbook();
+            for (const sheet of sheets) {
+                workbook.addWorksheet(sheet.name).addRows(sheet.rows);
+            }
+            return Buffer.from(await workbook.xlsx.writeBuffer());
+        };
+        const STATEMENT_HEADER = [
+            'Transaction Date', 'Posting Date', 'Nostro/BGL Account', 'Journal Number',
+            'Transaction Credit Amount', 'Transaction Debit Amount', 'Branch', 'End Date EoD Balance', 'Detailed Description',
+        ];
+        const REGISTER_HEADER = [
+            'c2_instr_type', 'c6_chq_no', 'c9_amount', 'c16_issued_date', 'c19_issued_jrnl_no', 'c25_matchd_post_dt', 'c27_matchd_jrnl_no',
+        ];
+        const ledger = await workbookBuffer([
+            { name: 'Credit', rows: [STATEMENT_HEADER, ['2025-03-10', '2025-03-11', '99801000', 'J5001', 100, null, '001', 2730, '']] },
+            { name: 'Debit', rows: [STATEMENT_HEADER, ['2025-04-01', null, '99801000', 'J6001', null, -100, '001', 2730, '']] },
+        ]);
+        const register = await workbookBuffer([
+            { name: 'Sheet1', rows: [REGISTER_HEADER, ['PO', 1001, 100, '2025-03-10', 'J5001', '2025-04-01', 'J6001']] },
+        ]);
+        const form = new FormData();
+        form.append('file', new File([ledger], 'ledger.xlsx'));
+        form.append('file', new File([register], 'register.xlsx'));
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1', 'content-type': 'multipart/form-data; boundary=test' },
+                form,
+            })
+        );
+        expect(response.status).toBe(201);
+        const run = response.jsonBody as LgRun;
+        expect(run.mode).toBe('register');
+        expect(run.chequeCount).toBe(1);
+        expect(run.files).toHaveLength(2);
     });
 
     it('rejects a file with missing required headers with 422 and stores nothing', async () => {

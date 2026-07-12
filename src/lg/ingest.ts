@@ -291,6 +291,26 @@ function parseRegisterFamily(sheets: SheetRows[], roles: ReturnType<typeof detec
 }
 
 /**
+ * Classifies pooled worksheets by role (GOAL-3 §4.1) and parses them:
+ * breakdown sheets keep the original pipeline; register-family sheets (ledger
+ * statements + cheque register) parse into postings AND cheques; mixed or
+ * half-register inputs are rejected.
+ */
+function ingestSheets(sheets: SheetRows[]): IngestResult {
+    const roles = sheets.map((sheet) => detectSheetRole(sheet.rows));
+    const { mode, error } = resolveMode(roles);
+    if (error) {
+        return { mode: 'breakdown', ...emptyResult([error]) };
+    }
+    if (mode === 'register') {
+        return parseRegisterFamily(sheets, roles);
+    }
+    // Breakdown mode — and the nothing-recognisable case, which parseSheets
+    // reports exactly as before (MISSING_HEADER details from the first sheet).
+    return { mode: 'breakdown', ...parseSheets(sheets) };
+}
+
+/**
  * Ingests an uploaded file (xlsx or csv, any number of worksheets). Worksheets
  * are classified by role (GOAL-3 §4.1): breakdown workbooks keep the original
  * pipeline; register-family workbooks (ledger statements + cheque register)
@@ -313,17 +333,60 @@ export async function ingest(buffer: Buffer, options: IngestOptions = {}): Promi
     if (format === 'csv') {
         return { mode: 'breakdown', ...parseSheets([{ rows: rowsFromCsv(buffer) }]) };
     }
+    return ingestSheets(await sheetsFromXlsx(buffer));
+}
 
-    const sheets = await sheetsFromXlsx(buffer);
-    const roles = sheets.map((sheet) => detectSheetRole(sheet.rows));
-    const { mode, error } = resolveMode(roles);
-    if (error) {
-        return { mode: 'breakdown', ...emptyResult([error]) };
+/** One file of a (possibly multi-file) upload. */
+export interface UploadFile {
+    buffer: Buffer;
+    filename?: string;
+    format?: IngestFormat;
+}
+
+/**
+ * Ingests one or more uploaded files as a SINGLE run: every file's worksheets
+ * pool together BEFORE role detection, so a register family split across files
+ * (the ledger extract in one, the cheque register in another) resolves — while
+ * mixed families still reject with MIXED_MODE. In multi-file uploads each
+ * sheet name gains a "filename › sheet" prefix (csv contributes one sheet
+ * named after its file) so errors and postings keep per-file provenance.
+ * A single file goes through ingest() unchanged — byte-identical behaviour.
+ */
+export async function ingestFiles(files: UploadFile[]): Promise<IngestResult> {
+    if (files.length === 0) {
+        return { mode: 'breakdown', ...emptyResult([{ code: 'EMPTY_INPUT', message: 'The upload contains no files' }]) };
     }
-    if (mode === 'register') {
-        return parseRegisterFamily(sheets, roles);
+    if (files.length === 1) {
+        return ingest(files[0].buffer, { filename: files[0].filename, format: files[0].format });
     }
-    // Breakdown mode — and the nothing-recognisable case, which parseSheets
-    // reports exactly as before (MISSING_HEADER details from the first sheet).
-    return { mode: 'breakdown', ...parseSheets(sheets) };
+    for (const file of files) {
+        if (isLegacyXls(file.buffer)) {
+            return {
+                mode: 'breakdown',
+                ...emptyResult([
+                    {
+                        code: 'UNSUPPORTED_FORMAT',
+                        message: `"${
+                            file.filename ?? 'One of the files'
+                        }" is a legacy .xls (BIFF) or password-protected workbook — re-save it as an unencrypted .xlsx or export .csv`,
+                    },
+                ]),
+            };
+        }
+    }
+
+    const sheets: SheetRows[] = [];
+    for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const label = file.filename ?? `File ${i + 1}`;
+        const format = detectFormat(file.buffer, file.filename, file.format);
+        if (format === 'csv') {
+            sheets.push({ name: label, rows: rowsFromCsv(file.buffer) });
+        } else {
+            for (const sheet of await sheetsFromXlsx(file.buffer)) {
+                sheets.push({ name: `${label} › ${sheet.name}`, rows: sheet.rows });
+            }
+        }
+    }
+    return ingestSheets(sheets);
 }

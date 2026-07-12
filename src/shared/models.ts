@@ -576,6 +576,15 @@ export interface Reconciliation {
     byBranch: BranchReconciliation[];
 }
 
+/** Per-file provenance for a run created from a multi-file upload. */
+export interface LgRunFile {
+    filename?: string;
+    format: 'xlsx' | 'csv';
+    /** SHA-256 of this file's raw bytes. */
+    sha256: string;
+    bytes: number;
+}
+
 /**
  * A persisted reconciliation run (GOAL.md §4 F9): the uploaded breakdown's identity
  * (hash), parse summary and errors, plus the F3 balances and F4 matching results
@@ -583,10 +592,18 @@ export interface Reconciliation {
  * input, and 550k rows would blow Cosmos document limits.
  */
 export interface LgRun extends BaseDocument {
+    /** Display name of the input: the file's name, or "a.xlsx + b.xlsx" for multi-file uploads. */
     filename?: string;
     format: 'xlsx' | 'csv';
-    /** SHA-256 of the uploaded bytes — same input ⇒ same hash (GOAL.md §5 determinism). */
+    /**
+     * SHA-256 identity of the input — same input ⇒ same hash (GOAL.md §5 determinism).
+     * Single file: hash of the raw bytes (unchanged from pre-multi-file runs).
+     * Multi-file: hash of the sorted per-file hashes, so the same SET of files
+     * dedupes regardless of upload order.
+     */
     inputSha256: string;
+    /** Per-file provenance; present only when the run came from a multi-file upload. */
+    files?: LgRunFile[];
     /** id of an earlier run with the same inputSha256, when one exists. */
     duplicateOf?: string;
     /** User id of the uploader (F9 audit / F10 access control). */

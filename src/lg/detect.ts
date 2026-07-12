@@ -48,8 +48,8 @@ export function resolveMode(roles: SheetRole[]): ModeResolution {
             error: {
                 code: 'MIXED_MODE',
                 message:
-                    'The workbook mixes both input families (transaction-breakdown sheets alongside ' +
-                    'register/ledger-statement sheets) — upload them as separate files',
+                    'The upload mixes both input families (transaction-breakdown sheets alongside ' +
+                    'register/ledger-statement sheets) — upload each family separately',
             },
         };
     }
@@ -61,8 +61,9 @@ export function resolveMode(roles: SheetRole[]): ModeResolution {
             error: {
                 code: 'INCOMPLETE_REGISTER_INPUT',
                 message:
-                    'The workbook carries a cheque-register sheet but no Credit/Debit ledger-statement ' +
-                    'sheets — the GL extract is required to reconcile against the register',
+                    'The upload carries a cheque-register sheet but no Credit/Debit ledger-statement ' +
+                    'sheets — the GL extract is required to reconcile against the register ' +
+                    '(it can be a separate file in the same upload)',
             },
         };
     }
@@ -71,8 +72,9 @@ export function resolveMode(roles: SheetRole[]): ModeResolution {
             error: {
                 code: 'INCOMPLETE_REGISTER_INPUT',
                 message:
-                    'The workbook carries ledger-statement sheet(s) but no cheque-register sheet — ' +
-                    'the register is required to identify cheque issuances and payments',
+                    'The upload carries ledger-statement sheet(s) but no cheque-register sheet — ' +
+                    'the register is required to identify cheque issuances and payments ' +
+                    '(it can be a separate file in the same upload)',
             },
         };
     }
