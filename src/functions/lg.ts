@@ -28,7 +28,22 @@ import { buildStatementWorkbook } from '../lg/export';
 import { detectFormat, ingest } from '../lg/ingest';
 import { matchPostings } from '../lg/match';
 import { reconcile } from '../lg/reconcile';
-import { LgException, LgRun, LgRunDetailChunk, MatchedSet } from '../shared/models';
+import { classifyRegisterExceptions } from '../lg/registerExceptions';
+import { matchRegister } from '../lg/registerMatch';
+import { extractStatedBalance, reconcileRegister } from '../lg/registerReconcile';
+import {
+    ChequeOutcome,
+    ChequeState,
+    ExceptionSummary,
+    LgException,
+    LgRun,
+    LgRunDetailChunk,
+    MatchedSet,
+    MatchSummary,
+    OutstandingItem,
+    ParseError,
+    Reconciliation,
+} from '../shared/models';
 
 /** Cosmos documents are capped at 2MB — store only the first errors plus the total count. */
 const MAX_STORED_ERRORS = 100;
@@ -106,19 +121,19 @@ export function buildDetailChunks<T>(
 async function storeDetailChunks(
     runId: string,
     kind: LgRunDetailChunk['kind'],
-    items: MatchedSet[] | LgException[]
+    items: MatchedSet[] | LgException[] | ChequeOutcome[]
 ): Promise<number> {
     const capped = items.slice(0, maxStoredDetailItems());
     const stored = kind === 'matchedSets' ? (capped as MatchedSet[]).map(trimMatchedSet) : capped;
-    const chunks = buildDetailChunks<MatchedSet | LgException>(stored);
+    const chunks = buildDetailChunks<MatchedSet | LgException | ChequeOutcome>(stored);
     for (let seq = 0; seq < chunks.length; seq++) {
-        await lgRunDetails.create({ runId, kind, seq, items: chunks[seq] as MatchedSet[] | LgException[] });
+        await lgRunDetails.create({ runId, kind, seq, items: chunks[seq] as LgRunDetailChunk['items'] });
     }
     return stored.length;
 }
 
 /** Reads every stored detail item of one kind for a run, in chunk order. */
-async function readDetailItems<T extends MatchedSet | LgException>(
+async function readDetailItems<T extends MatchedSet | LgException | ChequeOutcome>(
     runId: string,
     kind: LgRunDetailChunk['kind']
 ): Promise<T[]> {
@@ -155,7 +170,13 @@ function isIsoDate(text: string): boolean {
 }
 
 /** File/header-level codes that mean nothing was mappable — reject, don't store. */
-const REJECT_CODES = new Set(['MISSING_HEADER', 'EMPTY_INPUT', 'UNSUPPORTED_FORMAT']);
+const REJECT_CODES = new Set([
+    'MISSING_HEADER',
+    'EMPTY_INPUT',
+    'UNSUPPORTED_FORMAT',
+    'MIXED_MODE',
+    'INCOMPLETE_REGISTER_INPUT',
+]);
 
 interface Upload {
     buffer: Buffer;
@@ -215,11 +236,46 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
     // rather than storing a meaningless '1970-01-01' summary.
     const asOf = asOfParam ?? deriveAsOf(result.postings);
     const balances = computeBranchBalances(result.postings, asOf);
-    const match = result.postings.length > 0 ? matchPostings(result.postings, { asOf }) : undefined;
-    // F5: Difference & Balanced per branch, from the full (uncapped) outstanding list.
-    const reconciliation = match ? reconcile(balances, match.outstanding, { asOf }) : undefined;
-    // F6 (GOAL-2 G2): classify the outstanding items into reviewer-facing exceptions.
-    const exceptions = match ? detectExceptions(match.outstanding) : undefined;
+    const errors: ParseError[] = [...result.errors];
+
+    let match:
+        | { outstanding: OutstandingItem[]; matchedSets: MatchedSet[]; summary: MatchSummary }
+        | undefined;
+    let reconciliation: Reconciliation | undefined;
+    let exceptions: { exceptions: LgException[]; summary: ExceptionSummary } | undefined;
+    let outcomes: ChequeOutcome[] | undefined;
+    let registerFields: Pick<LgRun, 'chequeCount' | 'chequesByState' | 'preWindowChequeCount'> | undefined;
+
+    if (result.postings.length > 0) {
+        if (result.mode === 'register') {
+            // GOAL-3: two-legged GL↔register matching; the stated EoD balance
+            // drives the reconciliation block so the extract gap surfaces.
+            const registerMatch = matchRegister(result.postings, result.cheques ?? [], { asOf });
+            const stated = extractStatedBalance(result.postings);
+            if (stated.error) {
+                errors.push(stated.error);
+            }
+            reconciliation = reconcileRegister(stated.statedFils, balances, registerMatch, { asOf });
+            exceptions = classifyRegisterExceptions(registerMatch, reconciliation.byBranch[0]?.extractGapFils);
+            match = registerMatch;
+            outcomes = registerMatch.outcomes;
+            const chequesByState: Partial<Record<ChequeState, number>> = {};
+            for (const outcome of outcomes) {
+                chequesByState[outcome.state] = (chequesByState[outcome.state] ?? 0) + 1;
+            }
+            registerFields = {
+                chequeCount: (result.cheques ?? []).length,
+                chequesByState,
+                preWindowChequeCount: chequesByState.PRE_WINDOW ?? 0,
+            };
+        } else {
+            match = matchPostings(result.postings, { asOf });
+            // F5: Difference & Balanced per branch, from the full (uncapped) outstanding list.
+            reconciliation = reconcile(balances, match.outstanding, { asOf });
+            // F6 (GOAL-2 G2): classify the outstanding items into reviewer-facing exceptions.
+            exceptions = detectExceptions(match.outstanding);
+        }
+    }
 
     const inputSha256 = createHash('sha256').update(buffer).digest('hex');
     // Same-input detection (GOAL.md §5 re-runnability): link, but still store the re-run.
@@ -233,12 +289,16 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
     // clients (any already-written chunks reference a runId that no run document
     // carries — inert leftovers, invisible to the by-run queries).
     const runId = randomUUID();
-    // G3: matched sets + exceptions are chunked into lgRunDetails (capped, totals visible).
+    // G3: matched sets + exceptions (+ GOAL-3 cheque outcomes) are chunked into
+    // lgRunDetails (capped, totals visible).
     if (match && match.matchedSets.length > 0) {
         await storeDetailChunks(runId, 'matchedSets', match.matchedSets);
     }
     if (exceptions && exceptions.exceptions.length > 0) {
         await storeDetailChunks(runId, 'exceptions', exceptions.exceptions);
+    }
+    if (outcomes && outcomes.length > 0) {
+        await storeDetailChunks(runId, 'cheques', outcomes);
     }
     const run = await lgRuns.create({
         id: runId,
@@ -247,9 +307,10 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         inputSha256,
         duplicateOf: duplicates[0]?.id,
         uploadedBy: user.id,
+        mode: result.mode,
         summary: result.summary,
-        errorCount: result.errors.length,
-        errors: result.errors.slice(0, MAX_STORED_ERRORS),
+        errorCount: errors.length,
+        errors: errors.slice(0, MAX_STORED_ERRORS),
         asOf,
         balances: balances.slice(0, MAX_STORED_BALANCES),
         balancesCount: balances.length,
@@ -260,10 +321,12 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         matchedSetCount: match ? match.matchedSets.length : 0,
         exceptionCount: exceptions ? exceptions.summary.total : 0,
         exceptionsSummary: exceptions?.summary,
+        ...registerFields,
     });
     await recordAudit(user.id, 'lg.breakdown.ingested', 'lgRun', run.id, {
         filename,
         inputSha256,
+        mode: result.mode,
         dataRows: result.summary.dataRows,
         parsed: result.summary.parsed,
         netFils: result.summary.netFils,
@@ -271,6 +334,7 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         outstandingCount: match ? match.outstanding.length : 0,
         matchedSetCount: match ? match.matchedSets.length : 0,
         exceptionCount: exceptions ? exceptions.summary.total : 0,
+        chequeCount: registerFields?.chequeCount,
         balanced: reconciliation?.balanced,
         duplicateOf: duplicates[0]?.id,
     });
@@ -326,6 +390,8 @@ function detailListHandler(kind: LgRunDetailChunk['kind'], totalOf: (run: LgRun)
 
 export const listLgRunMatched = detailListHandler('matchedSets', (run) => run.matchedSetCount ?? 0);
 export const listLgRunExceptions = detailListHandler('exceptions', (run) => run.exceptionCount ?? 0);
+/** GOAL-3 R8: per-cheque outcomes of a register-mode run, offset-paged. */
+export const listLgRunCheques = detailListHandler('cheques', (run) => run.chequeCount ?? 0);
 
 /**
  * G5: the authoritative export — a two-sheet workbook (statement + Mismatched) built
@@ -391,6 +457,12 @@ app.http('lg-runs-exceptions', {
     methods: ['GET'],
     authLevel: 'function',
     handler: listLgRunExceptions,
+});
+app.http('lg-runs-cheques', {
+    route: 'lg/runs/{id}/cheques',
+    methods: ['GET'],
+    authLevel: 'function',
+    handler: listLgRunCheques,
 });
 app.http('lg-runs-export', {
     route: 'lg/runs/{id}/export',

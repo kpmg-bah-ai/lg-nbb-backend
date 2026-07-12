@@ -14,11 +14,12 @@ import {
     createLgRun,
     exportLgRun,
     getLgRun,
+    listLgRunCheques,
     listLgRunExceptions,
     listLgRunMatched,
     listLgRuns,
 } from '../../src/functions/lg';
-import { LgRun, User } from '../../src/shared/models';
+import { LgRun, LgRunDetailChunk, User } from '../../src/shared/models';
 
 const mockUserGet = users.get as jest.Mock;
 const mockRunCreate = lgRuns.create as jest.Mock;
@@ -582,5 +583,123 @@ describe('GET lg/runs/{id}', () => {
         mockRunGet.mockResolvedValue(undefined);
         const response = await getLgRun(fakeRequest({ headers: { 'x-user-id': 'u1' }, params: { id: 'nope' } }));
         expect(response.status).toBe(404);
+    });
+});
+
+describe('register-family pipeline (GOAL-3 R8)', () => {
+    it('ingests the register fixture and stores the register-mode run', async () => {
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'register-sample.xlsx', asOf: '2026-02-03' },
+                body: fixture('register-sample.xlsx'),
+            })
+        );
+        expect(response.status).toBe(201);
+        const run = mockRunCreate.mock.calls[0][0] as LgRun;
+
+        expect(run.mode).toBe('register');
+        expect(run.chequeCount).toBe(11);
+        expect(run.preWindowChequeCount).toBe(1); // CHQ 1003 (legacy 05)
+        expect(run.chequesByState).toEqual({
+            PAID: 2,
+            PAID_VIA_BATCH: 2,
+            OPS_PAID: 1,
+            OUTSTANDING: 4,
+            REGISTER_MATCHED_NO_DEBIT: 1,
+            PRE_WINDOW: 1,
+        });
+
+        expect(run.summary.parsed).toBe(16);
+        expect(run.matching?.matchKey).toEqual(['transactionDate', 'journalNumber', 'amountFils']);
+        expect(run.matchedSetCount).toBe(3);
+        expect(run.outstandingCount).toBe(9);
+        expect(run.exceptionCount).toBe(12);
+
+        const block = run.reconciliation!.byBranch[0];
+        expect(block.statedBalanceFils).toBe(-2730000);
+        expect(block.derivedBalanceFils).toBe(-2765500);
+        expect(block.extractGapFils).toBe(-35500);
+        expect(block.residualFils).toBe(35500);
+        expect(block.balanced).toBe(false);
+
+        // All three detail kinds are chunked: matched sets, exceptions, cheques.
+        const kinds = mockDetailCreate.mock.calls.map((c) => (c[0] as LgRunDetailChunk).kind);
+        expect(new Set(kinds)).toEqual(new Set(['matchedSets', 'exceptions', 'cheques']));
+
+        const audit = mockAuditCreate.mock.calls[0][0] as { details: Record<string, unknown> };
+        expect(audit.details.mode).toBe('register');
+    });
+
+    it('a breakdown upload stores mode breakdown (regression)', async () => {
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'balanced-sample.csv' },
+                body: fixture('balanced-sample.csv'),
+            })
+        );
+        expect(response.status).toBe(201);
+        const run = mockRunCreate.mock.calls[0][0] as LgRun;
+        expect(run.mode).toBe('breakdown');
+        expect(run.chequeCount).toBeUndefined();
+    });
+
+    it('rejects a lone ledger-statement sheet with 422', async () => {
+        const ExcelJS = await import('exceljs');
+        const workbook = new ExcelJS.Workbook();
+        workbook.addWorksheet('Credit').addRows([
+            ['Transaction Date', 'Posting Date', 'Nostro/BGL Account', 'Journal Number', 'Branch', 'Transaction Credit Amount', 'Transaction Debit Amount'],
+            [new Date('2025-03-10T00:00:00Z'), new Date('2025-03-10T00:00:00Z'), '99801000', 5001, '001', 100, null],
+        ]);
+        const buffer = Buffer.from(await workbook.xlsx.writeBuffer());
+        const response = await createLgRun(
+            fakeRequest({ headers: { 'x-user-id': 'u1' }, query: { filename: 'credit-only.xlsx' }, body: buffer })
+        );
+        expect(response.status).toBe(422);
+        expect(mockRunCreate).not.toHaveBeenCalled();
+        const errors = (response.jsonBody as { details: { errors: { code: string }[] } }).details.errors;
+        expect(errors[0].code).toBe('INCOMPLETE_REGISTER_INPUT');
+    });
+});
+
+describe('GET lg/runs/{id}/cheques (GOAL-3 R8)', () => {
+    const chunk = (seq: number, items: unknown[]) => ({ runId: 'run-1', kind: 'cheques', seq, items });
+
+    it('rejects anonymous requests with 401', async () => {
+        const response = await listLgRunCheques(fakeRequest({ params: { id: 'run-1' } }));
+        expect(response.status).toBe(401);
+    });
+
+    it('returns 404 for an unknown run', async () => {
+        mockRunGet.mockResolvedValue(undefined);
+        const response = await listLgRunCheques(fakeRequest({ headers: { 'x-user-id': 'u1' }, params: { id: 'x' } }));
+        expect(response.status).toBe(404);
+    });
+
+    it('pages the stored cheque outcomes with visible totals', async () => {
+        mockRunGet.mockResolvedValue({ id: 'run-1', chequeCount: 5 });
+        mockDetailQuery.mockResolvedValue([
+            chunk(0, [{ chequeNumber: '1' }, { chequeNumber: '2' }, { chequeNumber: '3' }]),
+            chunk(1, [{ chequeNumber: '4' }]),
+        ]);
+        const response = await listLgRunCheques(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                params: { id: 'run-1' },
+                query: { offset: '1', maxItems: '2' },
+            })
+        );
+        expect(response.status).toBe(200);
+        const body = response.jsonBody as {
+            items: { chequeNumber: string }[];
+            offset: number;
+            storedCount: number;
+            total: number;
+        };
+        expect(body.items.map((c) => c.chequeNumber)).toEqual(['2', '3']);
+        expect(body.offset).toBe(1);
+        expect(body.storedCount).toBe(4);
+        expect(body.total).toBe(5); // true engine total — storedCount < total ⇒ visible truncation
     });
 });
