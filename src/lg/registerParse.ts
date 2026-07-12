@@ -105,12 +105,15 @@ export function findRegisterHeaderRow(rows: RawRow[], maxScan = HEADER_SCAN_ROWS
 }
 
 /**
- * Strict dd/mm/yyyy text date, calendar-checked — used ONLY for the register's
- * `Ops Date` column. Anything else (ISO, month-first, garbage) is undefined:
- * surface, don't guess (GOAL.md §11.3).
+ * Strict day-first d[d]/m[m]/yyyy text date, calendar-checked — used ONLY for
+ * the register's `Ops Date` column. The real file mixes '15/08/2025' with
+ * single-digit variants like '8/1/2023' (measured in Task 12 calibration);
+ * both are the SAME declared day-first format. Anything else (ISO,
+ * double-slash typos, stray journal numbers) is undefined: surface, don't
+ * guess (GOAL.md §11.3).
  */
 export function parseDmyDate(text: string): string | undefined {
-    const m = text.trim().match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+    const m = text.trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
     if (!m) {
         return undefined;
     }
@@ -121,7 +124,7 @@ export function parseDmyDate(text: string): string | undefined {
     if (date.getUTCFullYear() !== y || date.getUTCMonth() !== mo - 1 || date.getUTCDate() !== d) {
         return undefined;
     }
-    return `${m[3]}-${m[2]}-${m[1]}`;
+    return `${m[3]}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
 }
 
 /** Trims and strips U+FFFD mojibake padding; empty ⇒ undefined. */

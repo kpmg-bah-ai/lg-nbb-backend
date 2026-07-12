@@ -67,9 +67,13 @@ function row(overrides: Partial<Record<string, unknown>>): RawRow {
 }
 
 describe('parseDmyDate', () => {
-    test('parses strict dd/mm/yyyy text', () => {
+    test('parses strict day-first d[d]/m[m]/yyyy text', () => {
         expect(parseDmyDate('15/08/2025')).toBe('2025-08-15');
         expect(parseDmyDate('01/01/2004')).toBe('2004-01-01');
+        // Single-digit variants measured in the real file (Task 12 calibration).
+        expect(parseDmyDate('8/1/2023')).toBe('2023-01-08');
+        expect(parseDmyDate('11/1/2023')).toBe('2023-01-11');
+        expect(parseDmyDate('2/02/2023')).toBe('2023-02-02');
     });
 
     test('rejects impossible calendar dates and other shapes', () => {
@@ -77,6 +81,8 @@ describe('parseDmyDate', () => {
         expect(parseDmyDate('31/02/2025')).toBeUndefined();
         expect(parseDmyDate('2025-08-15')).toBeUndefined(); // ISO is not this parser's job
         expect(parseDmyDate('8/15/2025')).toBeUndefined(); // month-first is a landmine, not a date
+        expect(parseDmyDate('09//04/2024')).toBeUndefined(); // double-slash typo — surfaced, not guessed
+        expect(parseDmyDate('100465347')).toBeUndefined(); // a journal number pasted in the date column
         expect(parseDmyDate('')).toBeUndefined();
     });
 });
