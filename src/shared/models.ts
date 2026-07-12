@@ -356,6 +356,8 @@ export interface OutstandingItem {
     reason: OutstandingReason;
     /** Register-family: the cheque this outstanding issuance credit belongs to (GOAL-3 §4.4). */
     cheque?: ChequeAttributes;
+    /** Register-family: `Ref.#` journals parsed from a batch debit's Detailed Description. */
+    batchRefs?: string[];
 }
 
 export interface MatchSummary {

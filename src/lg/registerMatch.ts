@@ -47,6 +47,28 @@ import { OLD_AFTER_DAYS } from './match';
 /** The §9.2 answer: the tuple key per leg. */
 export const REGISTER_MATCH_KEY = ['transactionDate', 'journalNumber', 'amountFils'];
 
+/**
+ * Extracts the `Ref.#` journal list a batch DEBIT POSTING embeds in its
+ * Detailed Description (file §5.3) — e.g. "DEBIT POSTING-20-Ref.# 100242402,…".
+ * Deduped, order-preserving. Tolerates spacing/punctuation drift.
+ */
+export function parseBatchRefs(text: string | undefined): string[] {
+    if (!text) {
+        return [];
+    }
+    const refs: string[] = [];
+    const seen = new Set<string>();
+    const pattern = /Ref\s*[.．]?\s*#\s*(\d+)/gi;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(text)) !== null) {
+        if (!seen.has(match[1])) {
+            seen.add(match[1]);
+            refs.push(match[1]);
+        }
+    }
+    return refs;
+}
+
 const MS_PER_DAY = 86_400_000;
 
 function daysBetween(fromIso: string, toIso: string): number {
@@ -211,6 +233,60 @@ export function matchRegister(
     runPass(credits, variantDate, issuanceBuckets, issuanceOf, 'POSTING_DATE_VARIANT');
     runPass(debits, variantDate, paymentBuckets, paymentOf, 'POSTING_DATE_VARIANT');
 
+    // Pass 4 (GOAL-3 §4.4): batch debits — one debit paying many cheques, its
+    // Detailed Description embedding the Ref.# journals of what it pays. FIFO
+    // by issue date, allocating only while Σ cheque amounts ≤ the debit amount:
+    // a batch can never clear more than its own value.
+    interface BatchAllocation {
+        debitIdx: number;
+        chequeIdxs: number[];
+        allocatedFils: number;
+    }
+    const batchAllocations: BatchAllocation[] = [];
+    const batchRefsByDebit = new Map<number, string[]>();
+    for (const idx of debits) {
+        if (postingConsumed[idx]) {
+            continue;
+        }
+        const refs = parseBatchRefs(postings[idx].detailedDescription);
+        if (refs.length === 0) {
+            continue;
+        }
+        batchRefsByDebit.set(idx, refs);
+        const refSet = new Set(refs);
+        const debitFils = Math.abs(postings[idx].amountBhdFils);
+        const candidates = cheques
+            .map((_, i) => i)
+            .filter(
+                (i) =>
+                    issuanceOf[i] !== undefined &&
+                    paymentOf[i] === undefined &&
+                    ((cheques[i].issuedJournal !== undefined && refSet.has(cheques[i].issuedJournal!)) ||
+                        (cheques[i].opsJournal !== undefined && refSet.has(cheques[i].opsJournal!)))
+            )
+            .sort((a, b) => {
+                const dateA = cheques[a].issuedDate ?? cheques[a].issuedPostDate ?? '';
+                const dateB = cheques[b].issuedDate ?? cheques[b].issuedPostDate ?? '';
+                return dateA < dateB ? -1 : dateA > dateB ? 1 : cheques[a].rowNumber - cheques[b].rowNumber;
+            });
+        const chequeIdxs: number[] = [];
+        let allocatedFils = 0;
+        for (const i of candidates) {
+            if (allocatedFils + cheques[i].amountFils <= debitFils) {
+                chequeIdxs.push(i);
+                allocatedFils += cheques[i].amountFils;
+            }
+        }
+        if (chequeIdxs.length === 0) {
+            continue;
+        }
+        for (const i of chequeIdxs) {
+            paymentOf[i] = { postingIdx: idx, via: 'BATCH_REF' };
+        }
+        postingConsumed[idx] = true;
+        batchAllocations.push({ debitIdx: idx, chequeIdxs, allocatedFils });
+    }
+
     // Collision visibility: a cheque whose key bucket (either leg) or ledger key
     // had more than one occupant — handled correctly, but reviewers must see it.
     const collides = (c: RegisterCheque): boolean => {
@@ -227,12 +303,14 @@ export function matchRegister(
     // Matched sets: only cheques with BOTH legs in the window net to zero.
     const matchedSets: MatchedSet[] = [];
     const inSet: boolean[] = new Array(postings.length).fill(false);
+    /** Batch debits only partly consumed: posting idx → allocated fils. */
+    const partialAllocated = new Map<number, number>();
     let matchedFils = 0;
     cheques.forEach((c, i) => {
         const issuance = issuanceOf[i];
         const payment = paymentOf[i];
-        if (!issuance || !payment) {
-            return;
+        if (!issuance || !payment || payment.via === 'BATCH_REF') {
+            return; // batch payments form one set per DEBIT below
         }
         const credit = postings[issuance.postingIdx];
         const debit = postings[payment.postingIdx];
@@ -261,6 +339,46 @@ export function matchRegister(
         });
     });
 
+    // Batch sets: one per batch debit — N issuance credit legs against one debit
+    // leg consumed up to the allocated amount. A partial allocation leaves the
+    // residual outstanding (never netted silently); the set is not fullyCleared.
+    for (const batch of batchAllocations) {
+        const debit = postings[batch.debitIdx];
+        const debitFils = Math.abs(debit.amountBhdFils);
+        const creditPostings = batch.chequeIdxs.map((i) => postings[issuanceOf[i]!.postingIdx]);
+        for (const i of batch.chequeIdxs) {
+            inSet[issuanceOf[i]!.postingIdx] = true;
+        }
+        const fullyCleared = batch.allocatedFils === debitFils;
+        if (fullyCleared) {
+            inSet[batch.debitIdx] = true;
+        } else {
+            partialAllocated.set(batch.debitIdx, batch.allocatedFils);
+        }
+        matchedFils += batch.allocatedFils;
+        const firstCreditDate = creditPostings.reduce(
+            (min, p) => (p.postDate < min ? p.postDate : min),
+            creditPostings[0].postDate
+        );
+        matchedSets.push({
+            entity: debit.entity,
+            gl: debit.gl,
+            branchNumber: debit.branchNumber,
+            accountNumber: undefined,
+            matchedFils: batch.allocatedFils,
+            creditLegCount: creditPostings.length,
+            debitLegCount: 1,
+            creditLegs: creditPostings.map(toMatchedLeg),
+            debitLegs: [{ ...toMatchedLeg(debit), matchedFils: batch.allocatedFils }],
+            firstCreditDate,
+            finalDebitDate: debit.postDate,
+            settledDays: daysBetween(firstCreditDate, debit.postDate),
+            fullyCleared,
+            chequeNumber: batch.chequeIdxs.length === 1 ? cheques[batch.chequeIdxs[0]].chequeNumber : undefined,
+            matchedVia: 'BATCH_REF',
+        });
+    }
+
     // Cheque attributes for issuance-linked credits that did NOT clear.
     const chequeOfCredit = new Map<number, number>(); // posting idx → cheque idx
     issuanceOf.forEach((link, chequeIdx) => {
@@ -269,7 +387,8 @@ export function matchRegister(
         }
     });
 
-    // Outstanding: every included posting not inside a zero-net set.
+    // Outstanding: every included posting not inside a zero-net set. Partially
+    // allocated batch debits surface their residual — never netted silently.
     const outstanding: OutstandingItem[] = [];
     for (const idx of included) {
         if (inSet[idx]) {
@@ -280,6 +399,8 @@ export function matchRegister(
         if (fils === 0) {
             continue;
         }
+        const allocated = partialAllocated.get(idx);
+        const outstandingFils = allocated !== undefined ? fils - allocated : fils;
         const chequeIdx = chequeOfCredit.get(idx);
         const cheque = chequeIdx !== undefined ? cheques[chequeIdx] : undefined;
         // Cheque-backed credits age from the register issuance date (§9.4).
@@ -293,16 +414,22 @@ export function matchRegister(
             postDate: p.postDate,
             direction: p.direction,
             originalFils: fils,
-            outstandingFils: fils,
-            outstanding: filsToBhd(fils),
+            outstandingFils,
+            outstanding: filsToBhd(outstandingFils),
             logCode: p.logCode,
             journalNumber: p.journalNumber,
             sequence: p.sequence,
             rowNumber: p.rowNumber,
             sheet: p.sheet,
             ageBucket,
-            reason: p.direction === 'debit' ? 'UNMATCHED_DEBIT' : 'UNMATCHED_CREDIT',
+            reason:
+                p.direction === 'debit'
+                    ? allocated !== undefined
+                        ? 'PARTIALLY_MATCHED_DEBIT'
+                        : 'UNMATCHED_DEBIT'
+                    : 'UNMATCHED_CREDIT',
             cheque: cheque ? toChequeAttributes(cheque) : undefined,
+            batchRefs: batchRefsByDebit.get(idx),
         });
     }
 
@@ -315,11 +442,16 @@ export function matchRegister(
         if (!issuance) {
             state = 'PRE_WINDOW';
         } else if (payment) {
-            state = 'PAID';
+            state = payment.via === 'BATCH_REF' ? 'PAID_VIA_BATCH' : 'PAID';
         } else if (registerMatched) {
             state = 'REGISTER_MATCHED_NO_DEBIT';
         } else if (c.status === '04' && (c.stopReason !== undefined || c.cancelDate !== undefined)) {
             state = 'STOPPED';
+        } else if (c.opsPaid) {
+            // Pass 5: the reviewer says paid but the ledger carries no evidence —
+            // excluded from the outstanding STATEMENT, classified as register lag;
+            // the GL credit itself stays outstanding (invariant).
+            state = 'OPS_PAID';
         } else {
             state = 'OUTSTANDING';
         }
@@ -328,7 +460,9 @@ export function matchRegister(
             ...c,
             state,
             matchedVia: payment
-                ? issuance && issuance.via === 'POSTING_DATE_VARIANT'
+                ? payment.via === 'BATCH_REF'
+                    ? 'BATCH_REF'
+                    : issuance && issuance.via === 'POSTING_DATE_VARIANT'
                     ? 'POSTING_DATE_VARIANT'
                     : payment.via
                 : undefined,
@@ -407,4 +541,18 @@ export function matchRegister(
     };
 
     return { outstanding, matchedSets, outcomes, summary };
+}
+
+/**
+ * The outstanding-items STATEMENT population (GOAL-3 §4.5): cheque-backed
+ * outstanding credits whose instrument state is OUTSTANDING. Ops-PAID,
+ * register-matched-without-debit and non-issuance items stay in the engine's
+ * outstanding set (invariant) but belong to the exceptions decomposition,
+ * not the Section A/B statement lines.
+ */
+export function statementOutstanding(result: RegisterMatchResult): OutstandingItem[] {
+    const stateByRow = new Map(result.outcomes.map((o) => [o.rowNumber, o.state]));
+    return result.outstanding.filter(
+        (o) => o.cheque !== undefined && stateByRow.get(o.cheque.registerRowNumber) === 'OUTSTANDING'
+    );
 }
