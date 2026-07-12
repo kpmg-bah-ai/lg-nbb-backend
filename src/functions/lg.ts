@@ -415,6 +415,29 @@ export async function exportLgRun(request: HttpRequest): Promise<HttpResponseIni
     const entity = request.query.get('entity');
     const gl = request.query.get('gl');
     const branch = request.query.get('branch');
+
+    // GOAL-3 R9: register-mode runs carry ONE consolidated GL-level block;
+    // ?branch= narrows the statement SECTIONS, never the block.
+    if (run.mode === 'register') {
+        const exceptions = await readDetailItems<LgException>(run.id, 'exceptions');
+        const outcomes = await readDetailItems<ChequeOutcome>(run.id, 'cheques');
+        const branchFilter = branch ?? undefined;
+        if (branchFilter !== undefined && !outcomes.some((o) => (o.issuedBranch ?? '') === branchFilter)) {
+            return notFound('No register cheques belong to the requested branch');
+        }
+        const buffer = await buildStatementWorkbook(run, blocks[0], exceptions, outcomes, branchFilter);
+        const scope = branchFilter !== undefined ? `Branch-${branchFilter}` : 'Consolidated';
+        const filename = `GL-Recon_${scope}_${run.reconciliation?.asOf ?? run.asOf ?? 'draft'}.xlsx`;
+        return {
+            status: 200,
+            body: new Uint8Array(buffer),
+            headers: {
+                'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'content-disposition': `attachment; filename="${filename}"`,
+            },
+        };
+    }
+
     const matches = blocks.filter(
         (b) =>
             (entity === null || b.entity === entity) &&

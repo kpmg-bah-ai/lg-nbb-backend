@@ -19,7 +19,7 @@
  */
 
 import * as ExcelJS from 'exceljs';
-import { BranchReconciliation, LgException, LgExceptionReason, LgRun } from '../shared/models';
+import { BranchReconciliation, ChequeOutcome, LgException, LgExceptionReason, LgRun } from '../shared/models';
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -62,20 +62,169 @@ export const EXC_TYPE_LABEL: Record<LgExceptionReason, string> = {
 export const STATEMENT_SHEET = 'MCQ+OLD ITEM';
 export const MISMATCHED_SHEET = 'Mismatched';
 
+/**
+ * GOAL-3 R9: the register-mode statement. Line items are the OUTSTANDING
+ * cheques themselves (real CHQ #, issuance date, payee, ops comments — §9.3
+ * answered), grouped per branch inside the two age sections; the block is
+ * GL-level (the file states one EoD per GL) and decomposes the Difference into
+ * classified exceptions and the unexplained residual. `branchFilter` narrows
+ * the SECTIONS to one branch (subtotals recomputed from the visible lines so
+ * the sheet stays internally consistent); the block always stays GL-level.
+ */
+function buildRegisterStatement(
+    ws: ExcelJS.Worksheet,
+    recon: BranchReconciliation,
+    outcomes: ChequeOutcome[],
+    reviewDate: string,
+    branchFilter?: string
+): void {
+    const lines = outcomes
+        .filter((o) => o.state === 'OUTSTANDING')
+        .filter((o) => branchFilter === undefined || (o.issuedBranch ?? '') === branchFilter)
+        .sort(
+            (a, b) =>
+                (a.issuedBranch ?? '').localeCompare(b.issuedBranch ?? '') ||
+                (a.issuedDate ?? '').localeCompare(b.issuedDate ?? '') ||
+                (a.chequeNumber ?? '').localeCompare(b.chequeNumber ?? '')
+        );
+    const oldLines = lines.filter((o) => o.ageBucket === 'old');
+    const currentLines = lines.filter((o) => o.ageBucket !== 'old');
+    const oldFils = oldLines.reduce((s, o) => s + o.amountFils, 0);
+    const currentFils = currentLines.reduce((s, o) => s + o.amountFils, 0);
+    const comment = (o: ChequeOutcome) =>
+        o.opsRemark ? `${o.opsRemark}${o.opsJournal ? ` · jrnl ${o.opsJournal}` : ''}${o.opsDate ? ` · ${fmtIsoDate(o.opsDate)}` : ''}` : '';
+
+    ws.columns = [6, 10, 16, 14, 14, 24, 18, 26, 14, 18, 28, 16].map((width) => ({ width }));
+    ws.getCell('A1').value = "GL Reconciliation — Outstanding Manager's Cheques (register-based)";
+    ws.getCell('A1').font = { bold: true };
+    ws.getCell('A2').value = `Branch: ${branchFilter ?? '(all branches)'}`;
+    ws.getCell('A3').value = `Entity: ${recon.entity}  ·  GL: ${recon.gl}  ·  Review Date: ${fmtIsoDate(reviewDate)}`;
+    if (branchFilter !== undefined) {
+        ws.getCell('A4').value =
+            'Sections filtered to one branch; the reconciliation block remains GL-level (consolidated).';
+    }
+
+    // GL-level reconciliation block (credit balances shown as magnitudes).
+    const glMagFils = Math.abs(recon.glBalanceFils);
+    const totalFils = oldFils + currentFils;
+    const blockRows: [string, string][] = [
+        ['GL Balance', fmtBhd(glMagFils)],
+        ['Total (OLD Item + MCQ)', fmtBhd(totalFils)],
+        ['Diffrence', fmtBhd(glMagFils - totalFils)], // sic — matching the reference sample
+        ['Classified exceptions (Sheet 2)', fmtBhd(Math.abs(recon.classifiedFils ?? 0))],
+        ['Unexplained residual', fmtBhd(Math.abs(recon.residualFils ?? 0))],
+        ['Derived balance (from postings)', fmtBhd(Math.abs(recon.derivedBalanceFils ?? 0))],
+        ['Ledger extract gap', fmtBhd(Math.abs(recon.extractGapFils ?? 0))],
+        ['Status', recon.balanced ? 'Balanced' : 'Not Balanced'],
+    ];
+    blockRows.forEach(([label, value], i) => {
+        ws.getCell(`K${2 + i}`).value = label;
+        ws.getCell(`L${2 + i}`).value = value;
+    });
+
+    let row = 11;
+    ws.getCell(`A${row}`).value = "Old Items Outstanding – Old Manager's Checks";
+    ws.getCell(`A${row}`).font = { bold: true };
+    row++;
+    ws.getRow(row).values = [
+        'No.',
+        'Branch',
+        'Amount (BHD)',
+        'Issuance Date',
+        'CHQ. #',
+        'Payee',
+        'Review Date',
+        'Comment',
+        'Register Status',
+        'Processed/Returned',
+    ];
+    ws.getRow(row).font = { bold: true };
+    row++;
+    oldLines.forEach((o, i) => {
+        ws.getRow(row).values = [
+            i + 1,
+            o.issuedBranch ?? '',
+            fmtBhd(o.amountFils),
+            fmtIsoDate(o.issuedDate ?? ''),
+            o.chequeNumber ?? '',
+            o.payee ?? '',
+            fmtIsoDate(reviewDate),
+            comment(o),
+            o.status ?? '',
+            '',
+        ];
+        row++;
+    });
+    ws.getCell(`A${row}`).value = 'Subtotal';
+    ws.getCell(`A${row}`).font = { bold: true };
+    ws.getCell(`C${row}`).value = fmtBhd(oldFils);
+    ws.getCell(`C${row}`).font = { bold: true };
+    row += 2;
+
+    ws.getCell(`A${row}`).value = 'Outstanding MCQ  (Less than 1 year)';
+    ws.getCell(`A${row}`).font = { bold: true };
+    row++;
+    ws.getRow(row).values = [
+        'No.',
+        'Branch',
+        'Amount (BHD)',
+        'Issuance Date',
+        'CHQ. #',
+        'Payee',
+        'Review Date',
+        'Comment',
+        'Register Status',
+    ];
+    ws.getRow(row).font = { bold: true };
+    row++;
+    currentLines.forEach((o, i) => {
+        ws.getRow(row).values = [
+            i + 1,
+            o.issuedBranch ?? '',
+            fmtBhd(o.amountFils),
+            fmtIsoDate(o.issuedDate ?? ''),
+            o.chequeNumber ?? '',
+            o.payee ?? '',
+            fmtIsoDate(reviewDate),
+            comment(o),
+            o.status ?? '',
+        ];
+        row++;
+    });
+    ws.getCell(`A${row}`).value = 'Subtotal';
+    ws.getCell(`A${row}`).font = { bold: true };
+    ws.getCell(`C${row}`).value = fmtBhd(currentFils);
+    ws.getCell(`C${row}`).font = { bold: true };
+}
+
 /** Builds the per-branch two-sheet workbook; returns the xlsx bytes. */
 export async function buildStatementWorkbook(
     run: LgRun,
     recon: BranchReconciliation,
-    exceptions: LgException[]
+    exceptions: LgException[],
+    /** Register-mode runs: the per-cheque outcomes that feed the statement lines. */
+    outcomes?: ChequeOutcome[],
+    /** Register-mode runs: narrow the statement sections to one branch. */
+    branchFilter?: string
 ): Promise<Buffer> {
     const reviewDate = run.reconciliation?.asOf ?? run.asOf ?? '';
-    const branchExceptions = exceptions.filter(
-        (e) => e.entity === recon.entity && e.gl === recon.gl && e.branchNumber === recon.branchNumber
-    );
+    const isRegister = run.mode === 'register' && outcomes !== undefined;
+    const branchExceptions = isRegister
+        ? exceptions
+        : exceptions.filter(
+              (e) => e.entity === recon.entity && e.gl === recon.gl && e.branchNumber === recon.branchNumber
+          );
     const oldItems = branchExceptions.filter((e) => e.ageBucket === 'old');
     const currentItems = branchExceptions.filter((e) => e.ageBucket === 'current');
 
     const workbook = new ExcelJS.Workbook();
+
+    if (isRegister) {
+        buildRegisterStatement(workbook.addWorksheet(STATEMENT_SHEET), recon, outcomes!, reviewDate, branchFilter);
+        appendExceptionSheet(workbook, branchExceptions);
+        const bytes = await workbook.xlsx.writeBuffer();
+        return Buffer.from(bytes as ArrayBuffer);
+    }
 
     // ── Sheet 1: the statement ────────────────────────────────────────────────
     const ws = workbook.addWorksheet(STATEMENT_SHEET);
@@ -163,7 +312,14 @@ export async function buildStatementWorkbook(
     ws.getCell(`B${row}`).value = fmtBhd(recon.currentFils);
     ws.getCell(`B${row}`).font = { bold: true };
 
-    // ── Sheet 2: the mismatched / exception items ────────────────────────────
+    appendExceptionSheet(workbook, branchExceptions);
+
+    const bytes = await workbook.xlsx.writeBuffer();
+    return Buffer.from(bytes as ArrayBuffer);
+}
+
+/** Sheet 2: the mismatched / exception items (shared by both statement modes). */
+function appendExceptionSheet(workbook: ExcelJS.Workbook, exceptions: LgException[]): void {
     const wsExc = workbook.addWorksheet(MISMATCHED_SHEET);
     wsExc.columns = [10, 22, 10, 16, 14, 20, 18, 32, 80].map((width) => ({ width }));
     wsExc.getCell('A1').value = 'Reconciling Exceptions / Mismatched Items';
@@ -180,7 +336,7 @@ export async function buildStatementWorkbook(
         'Reason / Required Action',
     ];
     wsExc.getRow(2).font = { bold: true };
-    branchExceptions.forEach((exc, i) => {
+    exceptions.forEach((exc, i) => {
         wsExc.getRow(3 + i).values = [
             `ROW-${exc.rowNumber}`,
             EXC_TYPE_LABEL[exc.reason],
@@ -193,7 +349,4 @@ export async function buildStatementWorkbook(
             exc.message,
         ];
     });
-
-    const bytes = await workbook.xlsx.writeBuffer();
-    return Buffer.from(bytes as ArrayBuffer);
 }
