@@ -1,0 +1,197 @@
+/**
+ * GOAL-3 R2 — ledger-statement sheet parser (src/lg/statementParse.ts).
+ *
+ * One schema for both Credit and Debit sheets: direction comes PER ROW from
+ * which amount column is populated (debits held negative in their own column),
+ * never from the sheet name. Captures the stated End Date EoD Balance and the
+ * Detailed Description (batch Ref.# lists) for later stages.
+ */
+
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { sheetsFromXlsx } from '../../src/lg/ingest';
+import { parseStatementSheet, STATEMENT_GL_ALIAS } from '../../src/lg/statementParse';
+import { RawRow } from '../../src/shared/models';
+
+const FIXTURE = join(__dirname, '..', 'fixtures', 'lg', 'register-sample.xlsx');
+
+// The real Task-0 header shape, including the duplicate Transaction Date (cols
+// 0 and 20) and the blank header at col 8.
+const HEADERS: RawRow = [
+    'Transaction Date',
+    'Posting Date',
+    'Nostro/BGL Account',
+    'Journal Number',
+    'New Ref',
+    'MGR CHQ Number',
+    'Account Name',
+    'Transaction Description',
+    '',
+    'Cheque Number',
+    'Transaction Credit Amount',
+    'Transaction Debit Amount',
+    'Transaction Type',
+    'Teller',
+    'Branch',
+    'End Date EoD Balance',
+    'Previous EoD Balance',
+    'Detailed Description',
+    'Outlet',
+    'Authorization',
+    'Transaction Date',
+    'Transaction Time',
+    'RRN',
+    'Card Number',
+    'Balance',
+    'Sequence Number',
+];
+
+function row(overrides: Partial<Record<string, unknown>> = {}): RawRow {
+    const base: Record<string, unknown> = {
+        'Transaction Date': new Date('2025-03-10T00:00:00Z'),
+        'Posting Date': new Date('2025-03-11T00:00:00Z'),
+        'Nostro/BGL Account': '99801000',
+        'Journal Number': 5001,
+        'Account Name': 'SAMPLE CUSTOMER',
+        'Transaction Description': 'DD ISSUED',
+        'Transaction Credit Amount': 100,
+        'Transaction Type': 'DD FROM DEP A/C',
+        Teller: 'T123',
+        Branch: '001',
+        'End Date EoD Balance': 2730,
+        'Previous EoD Balance': 2600,
+        'Detailed Description': '',
+        'Sequence Number': 1,
+        ...overrides,
+    };
+    const cells: RawRow = new Array(HEADERS.length).fill(null);
+    for (const [key, value] of Object.entries(base)) {
+        const idx = HEADERS.indexOf(key); // first occurrence wins — mirrors the parser
+        if (idx >= 0) {
+            cells[idx] = value as RawRow[number];
+        }
+    }
+    return cells;
+}
+
+describe('parseStatementSheet', () => {
+    test('a populated credit column makes a credit posting (negative signed fils)', () => {
+        const { postings, errors } = parseStatementSheet([HEADERS, row()], 'Credit');
+        expect(errors).toHaveLength(0);
+        expect(postings).toHaveLength(1);
+        const p = postings[0];
+        expect(p.direction).toBe('credit');
+        expect(p.amountBhdFils).toBe(-100000);
+        expect(p.transactionDate).toBe('2025-03-10'); // the key-leg date
+        expect(p.postDate).toBe('2025-03-11');
+        expect(p.gl).toBe('99801000');
+        expect(p.journalNumber).toBe('5001');
+        expect(p.branchNumber).toBe('001');
+        expect(p.entity).toBe(''); // no entity column in this layout (§2.4 default)
+        expect(p.currency).toBe('BHD'); // no currency column — default (§2.5)
+        expect(p.transactionType).toBe('DD FROM DEP A/C');
+        expect(p.accountName).toBe('SAMPLE CUSTOMER');
+        expect(p.statedEodFils).toBe(2730000);
+        expect(p.statedPrevEodFils).toBe(2600000);
+        expect(p.sheet).toBe('Credit');
+        expect(p.rowNumber).toBe(1);
+    });
+
+    test('a populated debit column (file-negative) makes a positive debit posting', () => {
+        const { postings } = parseStatementSheet(
+            [HEADERS, row({ 'Transaction Credit Amount': null, 'Transaction Debit Amount': -250.5 })],
+            'Debit'
+        );
+        expect(postings[0].direction).toBe('debit');
+        expect(postings[0].amountBhdFils).toBe(250500);
+    });
+
+    test('both amount columns non-zero is AMBIGUOUS_DIRECTION; both empty is BAD_AMOUNT', () => {
+        const both = parseStatementSheet(
+            [HEADERS, row({ 'Transaction Credit Amount': 100, 'Transaction Debit Amount': -50 })],
+            'Credit'
+        );
+        expect(both.postings).toHaveLength(0);
+        expect(both.errors).toEqual([expect.objectContaining({ code: 'AMBIGUOUS_DIRECTION', row: 1 })]);
+
+        const neither = parseStatementSheet(
+            [HEADERS, row({ 'Transaction Credit Amount': null, 'Transaction Debit Amount': null })],
+            'Credit'
+        );
+        expect(neither.postings).toHaveLength(0);
+        expect(neither.errors).toEqual([expect.objectContaining({ code: 'BAD_AMOUNT', row: 1 })]);
+    });
+
+    test('missing posting date falls back to the transaction date', () => {
+        const { postings } = parseStatementSheet([HEADERS, row({ 'Posting Date': null })], 'Credit');
+        expect(postings[0].postDate).toBe('2025-03-10');
+    });
+
+    test('required fields missing become row errors', () => {
+        const noJournal = parseStatementSheet([HEADERS, row({ 'Journal Number': null })], 'Credit');
+        expect(noJournal.postings).toHaveLength(0);
+        expect(noJournal.errors).toEqual([
+            expect.objectContaining({ code: 'MISSING_FIELD', field: 'journalNumber', row: 1 }),
+        ]);
+
+        const noDate = parseStatementSheet([HEADERS, row({ 'Transaction Date': null })], 'Credit');
+        expect(noDate.postings).toHaveLength(0);
+        expect(noDate.errors).toEqual([expect.objectContaining({ code: 'BAD_DATE', row: 1 })]);
+    });
+
+    test('detailed description and cheque number are carried for later stages', () => {
+        const { postings } = parseStatementSheet(
+            [
+                HEADERS,
+                row({
+                    'Transaction Credit Amount': null,
+                    'Transaction Debit Amount': -200,
+                    'Detailed Description': 'DEBIT POSTING-20-Ref.# 5007,Ref.# 5008',
+                    'Cheque Number': 1007,
+                }),
+            ],
+            'Debit'
+        );
+        expect(postings[0].detailedDescription).toBe('DEBIT POSTING-20-Ref.# 5007,Ref.# 5008');
+        expect(postings[0].chequeNumber).toBe('1007');
+    });
+
+    test('the reconciled disposition column is carried when present', () => {
+        const headers: RawRow = [...HEADERS, '', '', '', '', '', '', 'reconciled'];
+        const cells = row({ 'Transaction Credit Amount': null, 'Transaction Debit Amount': -10 });
+        const withNote: RawRow = [...cells, null, null, null, null, null, null, 'Datafix entry - not MC'];
+        const { postings } = parseStatementSheet([headers, withNote], 'Debit');
+        expect(postings[0].reconciledNote).toBe('Datafix entry - not MC');
+    });
+
+    test('rowOffset keeps row numbering continuous across sheets', () => {
+        const { postings } = parseStatementSheet([HEADERS, row()], 'Debit', 12);
+        expect(postings[0].rowNumber).toBe(13);
+    });
+
+    test('fixture Credit sheet: 12 postings summing to −3,675,500 fils', async () => {
+        const sheets = await sheetsFromXlsx(readFileSync(FIXTURE));
+        const credit = sheets.find((s) => s.name === 'Credit')!;
+        const { postings, errors } = parseStatementSheet(credit.rows, 'Credit');
+        expect(errors).toHaveLength(0);
+        expect(postings).toHaveLength(12);
+        expect(postings.every((p) => p.direction === 'credit')).toBe(true);
+        expect(postings.reduce((s, p) => s + p.amountBhdFils, 0)).toBe(-3675500);
+    });
+
+    test('fixture Debit sheet: 4 postings summing to +910,000 fils, padding skipped', async () => {
+        const sheets = await sheetsFromXlsx(readFileSync(FIXTURE));
+        const debit = sheets.find((s) => s.name === 'Debit')!;
+        const { postings, errors } = parseStatementSheet(debit.rows, 'Debit');
+        expect(errors).toHaveLength(0);
+        expect(postings).toHaveLength(4);
+        expect(postings.every((p) => p.direction === 'debit')).toBe(true);
+        expect(postings.reduce((s, p) => s + p.amountBhdFils, 0)).toBe(910000);
+        const batch = postings.find((p) => p.journalNumber === '8001')!;
+        expect(batch.detailedDescription).toContain('Ref.# 5007');
+    });
+
+    test('exports the GL header alias for role detection', () => {
+        expect(STATEMENT_GL_ALIAS).toBe('nostro/bglaccount');
+    });
+});
