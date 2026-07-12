@@ -247,6 +247,8 @@ export interface ChequeAttributes {
     purchaser?: string;
     opsRemark?: string;
     registerRowNumber: number;
+    /** The cheque's outcome state — lets stored items drive the statement filter. */
+    state?: ChequeState;
 }
 
 /**

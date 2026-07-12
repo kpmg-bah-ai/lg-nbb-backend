@@ -479,6 +479,15 @@ export function matchRegister(
         };
     });
 
+    // Stamp each outstanding cheque item with its instrument's outcome state so
+    // stored items can drive the statement filter without re-deriving it.
+    const stateByRegisterRow = new Map(outcomes.map((o) => [o.rowNumber, o.state]));
+    for (const item of outstanding) {
+        if (item.cheque) {
+            item.cheque.state = stateByRegisterRow.get(item.cheque.registerRowNumber);
+        }
+    }
+
     outstanding.sort(
         (a, b) =>
             a.branchNumber.localeCompare(b.branchNumber) ||
