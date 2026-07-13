@@ -2,10 +2,11 @@
  * LG reconciliation — HTTP surface for the ingest pipeline (GOAL.md §4 F1/F9/F10,
  * GOAL-2 G3/G5).
  *
- *   POST /api/lg/runs                 — upload a transaction breakdown (multipart "file"
- *                                       field, or the raw bytes with ?filename=…); parses
- *                                       it and stores the run. Header/file-level failures
- *                                       come back as 422.
+ *   POST /api/lg/runs                 — upload a transaction breakdown (one or more
+ *                                       multipart "file" fields — multiple files pool
+ *                                       into ONE combined run — or the raw bytes with
+ *                                       ?filename=…); parses it and stores the run.
+ *                                       Header/file-level failures come back as 422.
  *   GET  /api/lg/runs                 — list stored runs (paged).
  *   GET  /api/lg/runs/{id}            — one run with its summary and (capped) errors.
  *   GET  /api/lg/runs/{id}/matched    — the run's cleared sets (offset-paged, G3).
@@ -25,10 +26,28 @@ import { badRequest, created, error, json, notFound } from '../helpers/json';
 import { computeBranchBalances, deriveAsOf } from '../lg/balance';
 import { detectExceptions } from '../lg/exceptions';
 import { buildStatementWorkbook } from '../lg/export';
-import { detectFormat, ingest } from '../lg/ingest';
+import { detectFormat, ingestFiles } from '../lg/ingest';
 import { matchPostings } from '../lg/match';
 import { reconcile } from '../lg/reconcile';
-import { LgException, LgRun, LgRunDetailChunk, MatchedSet } from '../shared/models';
+import { classifyRegisterExceptions } from '../lg/registerExceptions';
+import { matchRegister } from '../lg/registerMatch';
+import { extractStatedBalance, reconcileRegister } from '../lg/registerReconcile';
+import { computeSheetBalances } from '../lg/sheetBalances';
+import { explainRun } from '../lg/provenance';
+import {
+    ChequeOutcome,
+    ChequeState,
+    ExceptionSummary,
+    LgException,
+    LgRun,
+    LgRunDetailChunk,
+    LgRunFile,
+    MatchedSet,
+    MatchSummary,
+    OutstandingItem,
+    ParseError,
+    Reconciliation,
+} from '../shared/models';
 
 /** Cosmos documents are capped at 2MB — store only the first errors plus the total count. */
 const MAX_STORED_ERRORS = 100;
@@ -106,19 +125,19 @@ export function buildDetailChunks<T>(
 async function storeDetailChunks(
     runId: string,
     kind: LgRunDetailChunk['kind'],
-    items: MatchedSet[] | LgException[]
+    items: MatchedSet[] | LgException[] | ChequeOutcome[]
 ): Promise<number> {
     const capped = items.slice(0, maxStoredDetailItems());
     const stored = kind === 'matchedSets' ? (capped as MatchedSet[]).map(trimMatchedSet) : capped;
-    const chunks = buildDetailChunks<MatchedSet | LgException>(stored);
+    const chunks = buildDetailChunks<MatchedSet | LgException | ChequeOutcome>(stored);
     for (let seq = 0; seq < chunks.length; seq++) {
-        await lgRunDetails.create({ runId, kind, seq, items: chunks[seq] as MatchedSet[] | LgException[] });
+        await lgRunDetails.create({ runId, kind, seq, items: chunks[seq] as LgRunDetailChunk['items'] });
     }
     return stored.length;
 }
 
 /** Reads every stored detail item of one kind for a run, in chunk order. */
-async function readDetailItems<T extends MatchedSet | LgException>(
+async function readDetailItems<T extends MatchedSet | LgException | ChequeOutcome>(
     runId: string,
     kind: LgRunDetailChunk['kind']
 ): Promise<T[]> {
@@ -155,28 +174,42 @@ function isIsoDate(text: string): boolean {
 }
 
 /** File/header-level codes that mean nothing was mappable — reject, don't store. */
-const REJECT_CODES = new Set(['MISSING_HEADER', 'EMPTY_INPUT', 'UNSUPPORTED_FORMAT']);
+const REJECT_CODES = new Set([
+    'MISSING_HEADER',
+    'EMPTY_INPUT',
+    'UNSUPPORTED_FORMAT',
+    'MIXED_MODE',
+    'INCOMPLETE_REGISTER_INPUT',
+]);
 
 interface Upload {
     buffer: Buffer;
     filename?: string;
 }
 
-/** Accepts either multipart form-data (a "file" field) or the raw file bytes as the body. */
-async function readUpload(request: HttpRequest): Promise<Upload> {
+/**
+ * Accepts multipart form-data (one or MORE "file" fields — a multi-file upload
+ * becomes one combined run) or the raw file bytes as the body (single file).
+ */
+async function readUpload(request: HttpRequest): Promise<Upload[]> {
     const contentType = request.headers.get('content-type') ?? '';
     if (contentType.includes('multipart/form-data')) {
         const form = await request.formData();
-        const file = form.get('file');
-        if (!file || typeof file === 'string') {
-            return { buffer: Buffer.alloc(0) };
+        const uploads: Upload[] = [];
+        for (const entry of form.getAll('file')) {
+            if (typeof entry === 'string') {
+                continue; // a text field named "file" is not an upload
+            }
+            uploads.push({ buffer: Buffer.from(await entry.arrayBuffer()), filename: entry.name || undefined });
         }
-        return { buffer: Buffer.from(await file.arrayBuffer()), filename: file.name || undefined };
+        return uploads;
     }
-    return {
-        buffer: Buffer.from(await request.arrayBuffer()),
-        filename: request.query.get('filename') ?? undefined,
-    };
+    return [
+        {
+            buffer: Buffer.from(await request.arrayBuffer()),
+            filename: request.query.get('filename') ?? undefined,
+        },
+    ];
 }
 
 export async function createLgRun(request: HttpRequest): Promise<HttpResponseInit> {
@@ -188,23 +221,36 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
     if (asOfParam && !isIsoDate(asOfParam)) {
         return badRequest('asOf must be a valid ISO date (yyyy-mm-dd)');
     }
-    let upload: Upload;
+    let uploads: Upload[];
     try {
-        upload = await readUpload(request);
+        uploads = await readUpload(request);
     } catch {
         return badRequest('The request body could not be read — check the multipart encoding');
     }
-    const { buffer, filename } = upload;
-    if (buffer.length === 0) {
+    if (uploads.length === 0 || uploads.every((u) => u.buffer.length === 0)) {
         return badRequest(
-            'Send the breakdown as a multipart "file" field or as the raw request body (with ?filename=…)'
+            'Send the breakdown as one or more multipart "file" fields or as the raw request body (with ?filename=…)'
         );
     }
-    if (buffer.length > maxUploadBytes()) {
-        return error(413, `The file exceeds the ${Math.floor(maxUploadBytes() / (1024 * 1024))}MB upload limit`);
+    const empty = uploads.find((u) => u.buffer.length === 0);
+    if (empty) {
+        return badRequest(`The uploaded file "${empty.filename ?? '(unnamed)'}" is empty`);
     }
-    const format = detectFormat(buffer, filename);
-    const result = await ingest(buffer, { filename, format });
+    const totalBytes = uploads.reduce((sum, u) => sum + u.buffer.length, 0);
+    if (totalBytes > maxUploadBytes()) {
+        return error(413, `The upload exceeds the ${Math.floor(maxUploadBytes() / (1024 * 1024))}MB limit`);
+    }
+    // Per-file identity, kept on the run for provenance when there is more than one file.
+    const files: LgRunFile[] = uploads.map((u) => ({
+        filename: u.filename,
+        format: detectFormat(u.buffer, u.filename),
+        sha256: createHash('sha256').update(u.buffer).digest('hex'),
+        bytes: u.buffer.length,
+    }));
+    const filename =
+        uploads.length === 1 ? uploads[0].filename : files.map((f) => f.filename ?? '(unnamed)').join(' + ');
+    const format = files[0].format;
+    const result = await ingestFiles(uploads.map((u) => ({ buffer: u.buffer, filename: u.filename })));
     // Header/file-level problems mean no rows were mapped — reject rather than store an empty run (F1).
     if (result.errors.some((e) => REJECT_CODES.has(e.code))) {
         return error(422, 'The file is not a recognisable transaction breakdown', { errors: result.errors });
@@ -215,13 +261,79 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
     // rather than storing a meaningless '1970-01-01' summary.
     const asOf = asOfParam ?? deriveAsOf(result.postings);
     const balances = computeBranchBalances(result.postings, asOf);
-    const match = result.postings.length > 0 ? matchPostings(result.postings, { asOf }) : undefined;
-    // F5: Difference & Balanced per branch, from the full (uncapped) outstanding list.
-    const reconciliation = match ? reconcile(balances, match.outstanding, { asOf }) : undefined;
-    // F6 (GOAL-2 G2): classify the outstanding items into reviewer-facing exceptions.
-    const exceptions = match ? detectExceptions(match.outstanding) : undefined;
+    const errors: ParseError[] = [...result.errors];
 
-    const inputSha256 = createHash('sha256').update(buffer).digest('hex');
+    let match:
+        | { outstanding: OutstandingItem[]; matchedSets: MatchedSet[]; summary: MatchSummary }
+        | undefined;
+    let reconciliation: Reconciliation | undefined;
+    let exceptions: { exceptions: LgException[]; summary: ExceptionSummary } | undefined;
+    let outcomes: ChequeOutcome[] | undefined;
+    let registerFields: Pick<LgRun, 'chequeCount' | 'chequesByState' | 'preWindowChequeCount'> | undefined;
+
+    if (result.postings.length > 0) {
+        if (result.mode === 'register') {
+            // GOAL-3: two-legged GL↔register matching; the stated EoD balance
+            // drives the reconciliation block so the extract gap surfaces.
+            const registerMatch = matchRegister(result.postings, result.cheques ?? [], { asOf });
+            const stated = extractStatedBalance(result.postings);
+            if (stated.error) {
+                errors.push(stated.error);
+            }
+            reconciliation = reconcileRegister(stated.statedFils, balances, registerMatch, { asOf });
+            exceptions = classifyRegisterExceptions(registerMatch, reconciliation.byBranch[0]?.extractGapFils);
+            match = registerMatch;
+            outcomes = registerMatch.outcomes;
+            const chequesByState: Partial<Record<ChequeState, number>> = {};
+            for (const outcome of outcomes) {
+                chequesByState[outcome.state] = (chequesByState[outcome.state] ?? 0) + 1;
+            }
+            registerFields = {
+                chequeCount: (result.cheques ?? []).length,
+                chequesByState,
+                preWindowChequeCount: chequesByState.PRE_WINDOW ?? 0,
+            };
+        } else {
+            match = matchPostings(result.postings, { asOf });
+            // F5: Difference & Balanced per branch, from the full (uncapped) outstanding list.
+            reconciliation = reconcile(balances, match.outstanding, { asOf });
+            // F6 (GOAL-2 G2): classify the outstanding items into reviewer-facing exceptions.
+            exceptions = detectExceptions(match.outstanding);
+        }
+    }
+
+    // GOAL-5: per-sheet balance reference + a plain-language basis/assessment for
+    // every headline number. Both are derived from figures already computed above
+    // (they never re-derive money), so they tie to the screen by construction and
+    // are saved on the run as the reviewer's reference.
+    const sheetBalances = computeSheetBalances(result);
+    const explanations = explainRun({
+        mode: result.mode,
+        summary: result.summary,
+        asOf,
+        balances,
+        sheetBalances,
+        reconciliation,
+        matching: match?.summary,
+        exceptionsSummary: exceptions?.summary,
+        chequeCount: registerFields?.chequeCount,
+        chequesByState: registerFields?.chequesByState,
+    });
+
+    // Input identity (GOAL.md §5 determinism). Single file: hash of the raw bytes,
+    // unchanged from pre-multi-file runs. Multi-file: hash of the SORTED per-file
+    // hashes, so the same set of files dedupes regardless of upload order.
+    const inputSha256 =
+        uploads.length === 1
+            ? files[0].sha256
+            : createHash('sha256')
+                  .update(
+                      files
+                          .map((f) => f.sha256)
+                          .sort()
+                          .join('')
+                  )
+                  .digest('hex');
     // Same-input detection (GOAL.md §5 re-runnability): link, but still store the re-run.
     const duplicates = await lgRuns.query<{ id: string }>({
         query: 'SELECT c.id FROM c WHERE c.inputSha256 = @hash ORDER BY c.createdAt ASC',
@@ -233,23 +345,31 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
     // clients (any already-written chunks reference a runId that no run document
     // carries — inert leftovers, invisible to the by-run queries).
     const runId = randomUUID();
-    // G3: matched sets + exceptions are chunked into lgRunDetails (capped, totals visible).
+    // G3: matched sets + exceptions (+ GOAL-3 cheque outcomes) are chunked into
+    // lgRunDetails (capped, totals visible).
     if (match && match.matchedSets.length > 0) {
         await storeDetailChunks(runId, 'matchedSets', match.matchedSets);
     }
     if (exceptions && exceptions.exceptions.length > 0) {
         await storeDetailChunks(runId, 'exceptions', exceptions.exceptions);
     }
+    if (outcomes && outcomes.length > 0) {
+        await storeDetailChunks(runId, 'cheques', outcomes);
+    }
     const run = await lgRuns.create({
         id: runId,
         filename,
         format,
         inputSha256,
+        // Per-file provenance only for multi-file uploads — single-file run docs
+        // keep their historic shape.
+        ...(uploads.length > 1 ? { files } : {}),
         duplicateOf: duplicates[0]?.id,
         uploadedBy: user.id,
+        mode: result.mode,
         summary: result.summary,
-        errorCount: result.errors.length,
-        errors: result.errors.slice(0, MAX_STORED_ERRORS),
+        errorCount: errors.length,
+        errors: errors.slice(0, MAX_STORED_ERRORS),
         asOf,
         balances: balances.slice(0, MAX_STORED_BALANCES),
         balancesCount: balances.length,
@@ -260,10 +380,15 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         matchedSetCount: match ? match.matchedSets.length : 0,
         exceptionCount: exceptions ? exceptions.summary.total : 0,
         exceptionsSummary: exceptions?.summary,
+        sheetBalances,
+        explanations,
+        ...registerFields,
     });
     await recordAudit(user.id, 'lg.breakdown.ingested', 'lgRun', run.id, {
         filename,
+        fileCount: uploads.length,
         inputSha256,
+        mode: result.mode,
         dataRows: result.summary.dataRows,
         parsed: result.summary.parsed,
         netFils: result.summary.netFils,
@@ -271,7 +396,10 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         outstandingCount: match ? match.outstanding.length : 0,
         matchedSetCount: match ? match.matchedSets.length : 0,
         exceptionCount: exceptions ? exceptions.summary.total : 0,
+        chequeCount: registerFields?.chequeCount,
         balanced: reconciliation?.balanced,
+        sheetCount: sheetBalances.length,
+        explainedFigureCount: explanations.length,
         duplicateOf: duplicates[0]?.id,
     });
     return created(run);
@@ -326,6 +454,8 @@ function detailListHandler(kind: LgRunDetailChunk['kind'], totalOf: (run: LgRun)
 
 export const listLgRunMatched = detailListHandler('matchedSets', (run) => run.matchedSetCount ?? 0);
 export const listLgRunExceptions = detailListHandler('exceptions', (run) => run.exceptionCount ?? 0);
+/** GOAL-3 R8: per-cheque outcomes of a register-mode run, offset-paged. */
+export const listLgRunCheques = detailListHandler('cheques', (run) => run.chequeCount ?? 0);
 
 /**
  * G5: the authoritative export — a two-sheet workbook (statement + Mismatched) built
@@ -349,6 +479,29 @@ export async function exportLgRun(request: HttpRequest): Promise<HttpResponseIni
     const entity = request.query.get('entity');
     const gl = request.query.get('gl');
     const branch = request.query.get('branch');
+
+    // GOAL-3 R9: register-mode runs carry ONE consolidated GL-level block;
+    // ?branch= narrows the statement SECTIONS, never the block.
+    if (run.mode === 'register') {
+        const exceptions = await readDetailItems<LgException>(run.id, 'exceptions');
+        const outcomes = await readDetailItems<ChequeOutcome>(run.id, 'cheques');
+        const branchFilter = branch ?? undefined;
+        if (branchFilter !== undefined && !outcomes.some((o) => (o.issuedBranch ?? '') === branchFilter)) {
+            return notFound('No register cheques belong to the requested branch');
+        }
+        const buffer = await buildStatementWorkbook(run, blocks[0], exceptions, outcomes, branchFilter);
+        const scope = branchFilter !== undefined ? `Branch-${branchFilter}` : 'Consolidated';
+        const filename = `GL-Recon_${scope}_${run.reconciliation?.asOf ?? run.asOf ?? 'draft'}.xlsx`;
+        return {
+            status: 200,
+            body: new Uint8Array(buffer),
+            headers: {
+                'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'content-disposition': `attachment; filename="${filename}"`,
+            },
+        };
+    }
+
     const matches = blocks.filter(
         (b) =>
             (entity === null || b.entity === entity) &&
@@ -391,6 +544,12 @@ app.http('lg-runs-exceptions', {
     methods: ['GET'],
     authLevel: 'function',
     handler: listLgRunExceptions,
+});
+app.http('lg-runs-cheques', {
+    route: 'lg/runs/{id}/cheques',
+    methods: ['GET'],
+    authLevel: 'function',
+    handler: listLgRunCheques,
 });
 app.http('lg-runs-export', {
     route: 'lg/runs/{id}/export',

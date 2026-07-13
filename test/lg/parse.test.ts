@@ -2,12 +2,14 @@ import { RawRow } from '../../src/shared/models';
 import {
     coerceDate,
     deriveDirection,
+    excelColumn,
     extractLogCode,
     mapHeaders,
     normalizeHeader,
     normalizeRow,
     parseAmountToFils,
     parseRows,
+    parseSheets,
 } from '../../src/lg/parse';
 
 // A trimmed header mirroring the real breakdown, including the CR/LF escape that
@@ -173,5 +175,113 @@ describe('parseRows', () => {
         const withBlank = parseRows([HEADER, [] as RawRow, dataRow(400, '020050 DEBIT POSTING', 'J1')]);
         expect(withBlank.summary.dataRows).toBe(1);
         expect(withBlank.postings).toHaveLength(1);
+    });
+});
+
+/**
+ * Wrong-value tracking: a non-empty cell that fails its column's format is
+ * saved on the error (raw value + spreadsheet column + header). Wrong values
+ * in optional columns never drop the row — it parses, and the wrongness is
+ * tracked with rowParsed. Empty cells are missing, never "wrong".
+ */
+describe('wrong-value tracking', () => {
+    const { columns } = mapHeaders(HEADER);
+
+    it('excelColumn turns 0-based indexes into spreadsheet letters', () => {
+        expect(excelColumn(0)).toBe('A');
+        expect(excelColumn(6)).toBe('G');
+        expect(excelColumn(25)).toBe('Z');
+        expect(excelColumn(26)).toBe('AA');
+    });
+
+    it('BAD_AMOUNT saves the wrong raw value and its column', () => {
+        const { posting, errors } = normalizeRow(dataRow('oops', '020050 DEBIT POSTING', 'J1'), columns, 1, HEADER);
+        expect(posting).toBeUndefined();
+        expect(errors).toContainEqual(
+            expect.objectContaining({
+                code: 'BAD_AMOUNT',
+                value: 'oops',
+                column: 'G',
+                columnHeader: 'Amount_x000D_\n(BHD)',
+            })
+        );
+    });
+
+    it('BAD_DATE saves the wrong raw value and its column', () => {
+        const { errors } = normalizeRow(dataRow(100, '020050 DEBIT POSTING', 'J1', 'journal 987'), columns, 1, HEADER);
+        expect(errors).toContainEqual(
+            expect.objectContaining({
+                code: 'BAD_DATE',
+                field: 'postDate',
+                value: 'journal 987',
+                column: 'D',
+                columnHeader: 'Post Date',
+            })
+        );
+    });
+
+    it('ZERO_AMOUNT saves the zero and its column', () => {
+        const { errors } = normalizeRow(dataRow(0, 'BAL TRF', 'J9'), columns, 1, HEADER);
+        expect(errors).toContainEqual(
+            expect.objectContaining({ code: 'ZERO_AMOUNT', value: '0', column: 'G' })
+        );
+    });
+
+    it('MISSING_FIELD names the column but carries no value (empty is missing, not wrong)', () => {
+        const { errors } = normalizeRow(dataRow(100, '020050 DEBIT POSTING', ''), columns, 2, HEADER);
+        const err = errors.find((e) => e.code === 'MISSING_FIELD');
+        expect(err).toMatchObject({ field: 'journalNumber', column: 'H', columnHeader: 'Journal Number' });
+        expect(err?.value).toBeUndefined();
+    });
+
+    it('a wrong optional value (Vale Date) is tracked but the row STILL parses', () => {
+        const header: RawRow = [...HEADER, 'Vale Date'];
+        const { columns: cols } = mapHeaders(header);
+        const raw: RawRow = [...dataRow(-400, '020030 BGL CR POSTING', 'J1'), 'not-a-date'];
+        const { posting, errors } = normalizeRow(raw, cols, 1, header);
+        expect(posting).toBeDefined();
+        expect(posting?.valueDate).toBeUndefined();
+        expect(errors).toContainEqual(
+            expect.objectContaining({
+                code: 'BAD_DATE',
+                field: 'valueDate',
+                value: 'not-a-date',
+                column: 'J',
+                columnHeader: 'Vale Date',
+                rowParsed: true,
+            })
+        );
+    });
+
+    it('an empty optional value is not wrong — no tracking entry', () => {
+        const header: RawRow = [...HEADER, 'Vale Date'];
+        const { columns: cols } = mapHeaders(header);
+        const { posting, errors } = normalizeRow([...dataRow(-400, '020030 BGL CR POSTING', 'J1'), ''], cols, 1, header);
+        expect(posting).toBeDefined();
+        expect(errors).toHaveLength(0);
+    });
+
+    it('a wrong FCY amount is tracked but never drops the row', () => {
+        const header: RawRow = [...HEADER, 'Amount (FCY)'];
+        const { columns: cols } = mapHeaders(header);
+        const { posting, errors } = normalizeRow([...dataRow(-400, '020030 BGL CR POSTING', 'J1'), '12x'], cols, 1, header);
+        expect(posting).toBeDefined();
+        expect(posting?.amountFcyFils).toBeUndefined();
+        expect(errors).toContainEqual(
+            expect.objectContaining({
+                code: 'BAD_AMOUNT',
+                field: 'amountFcy',
+                value: '12x',
+                column: 'J',
+                rowParsed: true,
+            })
+        );
+    });
+
+    it('parseSheets carries the tracking through with the sheet name', () => {
+        const result = parseSheets([{ name: 'Breakdown', rows: [HEADER, dataRow('bad', '020050 DEBIT POSTING', 'J1')] }]);
+        expect(result.errors).toContainEqual(
+            expect.objectContaining({ code: 'BAD_AMOUNT', sheet: 'Breakdown', value: 'bad', column: 'G' })
+        );
     });
 });

@@ -14,11 +14,12 @@ import {
     createLgRun,
     exportLgRun,
     getLgRun,
+    listLgRunCheques,
     listLgRunExceptions,
     listLgRunMatched,
     listLgRuns,
 } from '../../src/functions/lg';
-import { LgRun, User } from '../../src/shared/models';
+import { LgRun, LgRunDetailChunk, User } from '../../src/shared/models';
 
 const mockUserGet = users.get as jest.Mock;
 const mockRunCreate = lgRuns.create as jest.Mock;
@@ -111,6 +112,14 @@ describe('POST lg/runs (F1 upload + F9 persistence + F10 auth)', () => {
         expect(run.summary.parsed).toBe(6);
         expect(run.summary.netFils).toBe(0);
         expect(run.errorCount).toBe(0);
+        // GOAL-5: the run carries the per-sheet balance reference and a basis/assessment
+        // for every headline number — saved on the document, not just displayed.
+        expect(run.sheetBalances?.length).toBeGreaterThan(0);
+        expect(run.explanations?.length).toBeGreaterThan(0);
+        for (const f of run.explanations ?? []) {
+            expect(f.basis.length).toBeGreaterThan(0);
+            expect(f.assessment.length).toBeGreaterThan(0);
+        }
         expect(mockAuditCreate).toHaveBeenCalledWith(
             expect.objectContaining({ actor: 'u1', action: 'lg.breakdown.ingested', entityType: 'lgRun', entityId: run.id })
         );
@@ -130,6 +139,107 @@ describe('POST lg/runs (F1 upload + F9 persistence + F10 auth)', () => {
         expect(run.format).toBe('xlsx');
         expect(run.filename).toBe('balanced-sample.xlsx');
         expect(run.summary.parsed).toBe(6);
+        // Single-file runs keep the historic doc shape — no files[] block.
+        expect(run.files).toBeUndefined();
+    });
+
+    it('pools multiple multipart "file" fields into one combined run with per-file provenance', async () => {
+        const form = new FormData();
+        form.append('file', new File([fixture('balanced-sample.xlsx')], 'balanced-sample.xlsx'));
+        form.append('file', new File([fixture('unbalanced-sample.xlsx')], 'unbalanced-sample.xlsx'));
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1', 'content-type': 'multipart/form-data; boundary=test' },
+                form,
+            })
+        );
+        expect(response.status).toBe(201);
+        const run = response.jsonBody as LgRun;
+        expect(run.summary.parsed).toBe(9); // 6 balanced + 3 unbalanced postings in ONE run
+        expect(run.summary.netFils).toBe(5590614);
+        expect(run.filename).toBe('balanced-sample.xlsx + unbalanced-sample.xlsx');
+        expect(run.files).toHaveLength(2);
+        expect(run.files![0]).toMatchObject({ filename: 'balanced-sample.xlsx', format: 'xlsx' });
+        expect(run.files![1]).toMatchObject({ filename: 'unbalanced-sample.xlsx', format: 'xlsx' });
+        expect(run.files![0].sha256).toMatch(/^[0-9a-f]{64}$/);
+        expect(run.files![0].bytes).toBeGreaterThan(0);
+        expect(mockAuditCreate).toHaveBeenCalledWith(expect.objectContaining({ details: expect.objectContaining({ fileCount: 2 }) }));
+    });
+
+    it('computes the same inputSha256 regardless of file order (set-level dedupe)', async () => {
+        const upload = async (names: string[]) => {
+            const form = new FormData();
+            for (const name of names) {
+                form.append('file', new File([fixture(name)], name));
+            }
+            const response = await createLgRun(
+                fakeRequest({
+                    headers: { 'x-user-id': 'u1', 'content-type': 'multipart/form-data; boundary=test' },
+                    form,
+                })
+            );
+            expect(response.status).toBe(201);
+            return (response.jsonBody as LgRun).inputSha256;
+        };
+        const hashAB = await upload(['balanced-sample.xlsx', 'unbalanced-sample.xlsx']);
+        const hashBA = await upload(['unbalanced-sample.xlsx', 'balanced-sample.xlsx']);
+        expect(hashAB).toMatch(/^[0-9a-f]{64}$/);
+        expect(hashBA).toBe(hashAB);
+    });
+
+    it('rejects a multi-file upload whose combined size exceeds the cap with 413', async () => {
+        const single = fixture('balanced-sample.xlsx');
+        process.env.LG_MAX_UPLOAD_BYTES = String(single.length + 10); // one fits, two do not
+        const form = new FormData();
+        form.append('file', new File([single], 'a.xlsx'));
+        form.append('file', new File([single], 'b.xlsx'));
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1', 'content-type': 'multipart/form-data; boundary=test' },
+                form,
+            })
+        );
+        expect(response.status).toBe(413);
+        expect(mockRunCreate).not.toHaveBeenCalled();
+    });
+
+    it('accepts a register family split across two files', async () => {
+        const ExcelJS = await import('exceljs');
+        const workbookBuffer = async (sheets: { name: string; rows: unknown[][] }[]) => {
+            const workbook = new ExcelJS.Workbook();
+            for (const sheet of sheets) {
+                workbook.addWorksheet(sheet.name).addRows(sheet.rows);
+            }
+            return Buffer.from(await workbook.xlsx.writeBuffer());
+        };
+        const STATEMENT_HEADER = [
+            'Transaction Date', 'Posting Date', 'Nostro/BGL Account', 'Journal Number',
+            'Transaction Credit Amount', 'Transaction Debit Amount', 'Branch', 'End Date EoD Balance', 'Detailed Description',
+        ];
+        const REGISTER_HEADER = [
+            'c2_instr_type', 'c6_chq_no', 'c9_amount', 'c16_issued_date', 'c19_issued_jrnl_no', 'c25_matchd_post_dt', 'c27_matchd_jrnl_no',
+        ];
+        const ledger = await workbookBuffer([
+            { name: 'Credit', rows: [STATEMENT_HEADER, ['2025-03-10', '2025-03-11', '99801000', 'J5001', 100, null, '001', 2730, '']] },
+            { name: 'Debit', rows: [STATEMENT_HEADER, ['2025-04-01', null, '99801000', 'J6001', null, -100, '001', 2730, '']] },
+        ]);
+        const register = await workbookBuffer([
+            { name: 'Sheet1', rows: [REGISTER_HEADER, ['PO', 1001, 100, '2025-03-10', 'J5001', '2025-04-01', 'J6001']] },
+        ]);
+        const form = new FormData();
+        form.append('file', new File([ledger], 'ledger.xlsx'));
+        form.append('file', new File([register], 'register.xlsx'));
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1', 'content-type': 'multipart/form-data; boundary=test' },
+                form,
+            })
+        );
+        expect(response.status).toBe(201);
+        const run = response.jsonBody as LgRun;
+        expect(run.mode).toBe('register');
+        expect(run.chequeCount).toBe(1);
+        expect(run.files).toHaveLength(2);
     });
 
     it('rejects a file with missing required headers with 422 and stores nothing', async () => {
@@ -582,5 +692,123 @@ describe('GET lg/runs/{id}', () => {
         mockRunGet.mockResolvedValue(undefined);
         const response = await getLgRun(fakeRequest({ headers: { 'x-user-id': 'u1' }, params: { id: 'nope' } }));
         expect(response.status).toBe(404);
+    });
+});
+
+describe('register-family pipeline (GOAL-3 R8)', () => {
+    it('ingests the register fixture and stores the register-mode run', async () => {
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'register-sample.xlsx', asOf: '2026-02-03' },
+                body: fixture('register-sample.xlsx'),
+            })
+        );
+        expect(response.status).toBe(201);
+        const run = mockRunCreate.mock.calls[0][0] as LgRun;
+
+        expect(run.mode).toBe('register');
+        expect(run.chequeCount).toBe(11);
+        expect(run.preWindowChequeCount).toBe(1); // CHQ 1003 (legacy 05)
+        expect(run.chequesByState).toEqual({
+            PAID: 2,
+            PAID_VIA_BATCH: 2,
+            OPS_PAID: 1,
+            OUTSTANDING: 4,
+            REGISTER_MATCHED_NO_DEBIT: 1,
+            PRE_WINDOW: 1,
+        });
+
+        expect(run.summary.parsed).toBe(16);
+        expect(run.matching?.matchKey).toEqual(['transactionDate', 'journalNumber', 'amountFils']);
+        expect(run.matchedSetCount).toBe(3);
+        expect(run.outstandingCount).toBe(9);
+        expect(run.exceptionCount).toBe(12);
+
+        const block = run.reconciliation!.byBranch[0];
+        expect(block.statedBalanceFils).toBe(-2730000);
+        expect(block.derivedBalanceFils).toBe(-2765500);
+        expect(block.extractGapFils).toBe(-35500);
+        expect(block.residualFils).toBe(35500);
+        expect(block.balanced).toBe(false);
+
+        // All three detail kinds are chunked: matched sets, exceptions, cheques.
+        const kinds = mockDetailCreate.mock.calls.map((c) => (c[0] as LgRunDetailChunk).kind);
+        expect(new Set(kinds)).toEqual(new Set(['matchedSets', 'exceptions', 'cheques']));
+
+        const audit = mockAuditCreate.mock.calls[0][0] as { details: Record<string, unknown> };
+        expect(audit.details.mode).toBe('register');
+    });
+
+    it('a breakdown upload stores mode breakdown (regression)', async () => {
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'balanced-sample.csv' },
+                body: fixture('balanced-sample.csv'),
+            })
+        );
+        expect(response.status).toBe(201);
+        const run = mockRunCreate.mock.calls[0][0] as LgRun;
+        expect(run.mode).toBe('breakdown');
+        expect(run.chequeCount).toBeUndefined();
+    });
+
+    it('rejects a lone ledger-statement sheet with 422', async () => {
+        const ExcelJS = await import('exceljs');
+        const workbook = new ExcelJS.Workbook();
+        workbook.addWorksheet('Credit').addRows([
+            ['Transaction Date', 'Posting Date', 'Nostro/BGL Account', 'Journal Number', 'Branch', 'Transaction Credit Amount', 'Transaction Debit Amount'],
+            [new Date('2025-03-10T00:00:00Z'), new Date('2025-03-10T00:00:00Z'), '99801000', 5001, '001', 100, null],
+        ]);
+        const buffer = Buffer.from(await workbook.xlsx.writeBuffer());
+        const response = await createLgRun(
+            fakeRequest({ headers: { 'x-user-id': 'u1' }, query: { filename: 'credit-only.xlsx' }, body: buffer })
+        );
+        expect(response.status).toBe(422);
+        expect(mockRunCreate).not.toHaveBeenCalled();
+        const errors = (response.jsonBody as { details: { errors: { code: string }[] } }).details.errors;
+        expect(errors[0].code).toBe('INCOMPLETE_REGISTER_INPUT');
+    });
+});
+
+describe('GET lg/runs/{id}/cheques (GOAL-3 R8)', () => {
+    const chunk = (seq: number, items: unknown[]) => ({ runId: 'run-1', kind: 'cheques', seq, items });
+
+    it('rejects anonymous requests with 401', async () => {
+        const response = await listLgRunCheques(fakeRequest({ params: { id: 'run-1' } }));
+        expect(response.status).toBe(401);
+    });
+
+    it('returns 404 for an unknown run', async () => {
+        mockRunGet.mockResolvedValue(undefined);
+        const response = await listLgRunCheques(fakeRequest({ headers: { 'x-user-id': 'u1' }, params: { id: 'x' } }));
+        expect(response.status).toBe(404);
+    });
+
+    it('pages the stored cheque outcomes with visible totals', async () => {
+        mockRunGet.mockResolvedValue({ id: 'run-1', chequeCount: 5 });
+        mockDetailQuery.mockResolvedValue([
+            chunk(0, [{ chequeNumber: '1' }, { chequeNumber: '2' }, { chequeNumber: '3' }]),
+            chunk(1, [{ chequeNumber: '4' }]),
+        ]);
+        const response = await listLgRunCheques(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                params: { id: 'run-1' },
+                query: { offset: '1', maxItems: '2' },
+            })
+        );
+        expect(response.status).toBe(200);
+        const body = response.jsonBody as {
+            items: { chequeNumber: string }[];
+            offset: number;
+            storedCount: number;
+            total: number;
+        };
+        expect(body.items.map((c) => c.chequeNumber)).toEqual(['2', '3']);
+        expect(body.offset).toBe(1);
+        expect(body.storedCount).toBe(4);
+        expect(body.total).toBe(5); // true engine total — storedCount < total ⇒ visible truncation
     });
 });

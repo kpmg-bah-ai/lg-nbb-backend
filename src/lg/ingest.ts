@@ -13,10 +13,19 @@
 
 import { Readable } from 'node:stream';
 import * as ExcelJS from 'exceljs';
-import { ParseResult, RawCell, RawRow } from '../shared/models';
+import { LgRunMode, ParseError, ParsedPosting, ParseResult, RawCell, RawRow, RegisterCheque } from '../shared/models';
+import { detectSheetRole, resolveMode } from './detect';
 import { parseSheets, SheetRows } from './parse';
+import { parseRegisterSheet } from './registerParse';
+import { parseStatementSheet } from './statementParse';
 
 export type IngestFormat = 'xlsx' | 'csv';
+
+/** ParseResult plus the input family and (register mode) the parsed cheque register. */
+export type IngestResult = ParseResult & {
+    mode: LgRunMode;
+    cheques?: RegisterCheque[];
+};
 
 /** Unwraps an exceljs cell value (formula/richText/hyperlink objects) into a scalar. */
 function unwrapCell(value: unknown): RawCell {
@@ -203,30 +212,181 @@ export interface IngestOptions {
     format?: IngestFormat;
 }
 
-/** Ingests a breakdown file (xlsx or csv, any number of worksheets) into a ParseResult. */
-export async function ingest(buffer: Buffer, options: IngestOptions = {}): Promise<ParseResult> {
+function emptyResult(errors: ParseError[]): ParseResult {
+    return {
+        postings: [],
+        errors,
+        summary: { dataRows: 0, parsed: 0, debitCount: 0, creditCount: 0, netFils: 0, currencies: [], branches: [] },
+    };
+}
+
+/**
+ * Parses a register-family workbook (GOAL-3 §4.1): ledger-statement sheets feed
+ * postings (continuous row numbering across sheets), register sheets feed
+ * cheques, anything else is SHEET_SKIPPED. Direction is per row, so the
+ * Credit/Debit sheet split is irrelevant to correctness.
+ */
+function parseRegisterFamily(sheets: SheetRows[], roles: ReturnType<typeof detectSheetRole>[]): IngestResult {
+    const postings: ParsedPosting[] = [];
+    const cheques: RegisterCheque[] = [];
+    const errors: ParseError[] = [];
+    let ledgerRows = 0;
+    let registerRows = 0;
+
+    for (let i = 0; i < sheets.length; i++) {
+        const sheet = sheets[i];
+        if (roles[i] === 'ledgerStatement') {
+            const result = parseStatementSheet(sheet.rows, sheet.name, ledgerRows);
+            postings.push(...result.postings);
+            errors.push(...result.errors);
+            ledgerRows += result.dataRows;
+        } else if (roles[i] === 'register') {
+            const result = parseRegisterSheet(sheet.rows, sheet.name);
+            // Keep cheque row numbers unique across multiple register sheets.
+            cheques.push(...result.cheques.map((c) => ({ ...c, rowNumber: c.rowNumber + registerRows })));
+            errors.push(...result.errors);
+            registerRows += result.dataRows;
+        } else {
+            errors.push({
+                code: 'SHEET_SKIPPED',
+                sheet: sheet.name,
+                message: `Worksheet ${
+                    sheet.name ? `"${sheet.name}"` : '(unnamed)'
+                } matches neither the ledger-statement nor the register schema — skipped`,
+            });
+        }
+    }
+
+    let debitCount = 0;
+    let creditCount = 0;
+    let netFils = 0;
+    const currencies = new Set<string>();
+    const branches = new Set<string>();
+    for (const p of postings) {
+        netFils += p.amountBhdFils;
+        if (p.direction === 'debit') {
+            debitCount++;
+        } else {
+            creditCount++;
+        }
+        currencies.add(p.currency);
+        branches.add(p.branchNumber);
+    }
+
+    return {
+        mode: 'register',
+        postings,
+        cheques,
+        errors,
+        summary: {
+            dataRows: ledgerRows + registerRows,
+            parsed: postings.length,
+            debitCount,
+            creditCount,
+            netFils,
+            currencies: [...currencies].sort(),
+            branches: [...branches].sort(),
+        },
+    };
+}
+
+/**
+ * Classifies pooled worksheets by role (GOAL-3 §4.1) and parses them:
+ * breakdown sheets keep the original pipeline; register-family sheets (ledger
+ * statements + cheque register) parse into postings AND cheques; mixed or
+ * half-register inputs are rejected.
+ */
+function ingestSheets(sheets: SheetRows[]): IngestResult {
+    const roles = sheets.map((sheet) => detectSheetRole(sheet.rows));
+    const { mode, error } = resolveMode(roles);
+    if (error) {
+        return { mode: 'breakdown', ...emptyResult([error]) };
+    }
+    if (mode === 'register') {
+        return parseRegisterFamily(sheets, roles);
+    }
+    // Breakdown mode — and the nothing-recognisable case, which parseSheets
+    // reports exactly as before (MISSING_HEADER details from the first sheet).
+    return { mode: 'breakdown', ...parseSheets(sheets) };
+}
+
+/**
+ * Ingests an uploaded file (xlsx or csv, any number of worksheets). Worksheets
+ * are classified by role (GOAL-3 §4.1): breakdown workbooks keep the original
+ * pipeline; register-family workbooks (ledger statements + cheque register)
+ * parse into postings AND cheques; mixed or half-register inputs are rejected.
+ */
+export async function ingest(buffer: Buffer, options: IngestOptions = {}): Promise<IngestResult> {
     if (isLegacyXls(buffer)) {
         return {
-            postings: [],
-            errors: [
+            mode: 'breakdown',
+            ...emptyResult([
                 {
                     code: 'UNSUPPORTED_FORMAT',
                     message:
                         'Legacy .xls (BIFF) and password-protected workbooks are not supported — re-save the file as an unencrypted .xlsx or export .csv',
                 },
-            ],
-            summary: {
-                dataRows: 0,
-                parsed: 0,
-                debitCount: 0,
-                creditCount: 0,
-                netFils: 0,
-                currencies: [],
-                branches: [],
-            },
+            ]),
         };
     }
     const format = detectFormat(buffer, options.filename, options.format);
-    const sheets: SheetRows[] = format === 'xlsx' ? await sheetsFromXlsx(buffer) : [{ rows: rowsFromCsv(buffer) }];
-    return parseSheets(sheets);
+    if (format === 'csv') {
+        return { mode: 'breakdown', ...parseSheets([{ rows: rowsFromCsv(buffer) }]) };
+    }
+    return ingestSheets(await sheetsFromXlsx(buffer));
+}
+
+/** One file of a (possibly multi-file) upload. */
+export interface UploadFile {
+    buffer: Buffer;
+    filename?: string;
+    format?: IngestFormat;
+}
+
+/**
+ * Ingests one or more uploaded files as a SINGLE run: every file's worksheets
+ * pool together BEFORE role detection, so a register family split across files
+ * (the ledger extract in one, the cheque register in another) resolves — while
+ * mixed families still reject with MIXED_MODE. In multi-file uploads each
+ * sheet name gains a "filename › sheet" prefix (csv contributes one sheet
+ * named after its file) so errors and postings keep per-file provenance.
+ * A single file goes through ingest() unchanged — byte-identical behaviour.
+ */
+export async function ingestFiles(files: UploadFile[]): Promise<IngestResult> {
+    if (files.length === 0) {
+        return { mode: 'breakdown', ...emptyResult([{ code: 'EMPTY_INPUT', message: 'The upload contains no files' }]) };
+    }
+    if (files.length === 1) {
+        return ingest(files[0].buffer, { filename: files[0].filename, format: files[0].format });
+    }
+    for (const file of files) {
+        if (isLegacyXls(file.buffer)) {
+            return {
+                mode: 'breakdown',
+                ...emptyResult([
+                    {
+                        code: 'UNSUPPORTED_FORMAT',
+                        message: `"${
+                            file.filename ?? 'One of the files'
+                        }" is a legacy .xls (BIFF) or password-protected workbook — re-save it as an unencrypted .xlsx or export .csv`,
+                    },
+                ]),
+            };
+        }
+    }
+
+    const sheets: SheetRows[] = [];
+    for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const label = file.filename ?? `File ${i + 1}`;
+        const format = detectFormat(file.buffer, file.filename, file.format);
+        if (format === 'csv') {
+            sheets.push({ name: label, rows: rowsFromCsv(file.buffer) });
+        } else {
+            for (const sheet of await sheetsFromXlsx(file.buffer)) {
+                sheets.push({ name: `${label} › ${sheet.name}`, rows: sheet.rows });
+            }
+        }
+    }
+    return ingestSheets(sheets);
 }

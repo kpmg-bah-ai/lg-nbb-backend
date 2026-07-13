@@ -28,6 +28,66 @@ export function normalizeHeader(value: RawCell): string {
         .replace(/[\s_]+/g, '');
 }
 
+/** 0-based column index → spreadsheet column letter ('A'…'Z', 'AA'…). */
+export function excelColumn(index: number): string {
+    let n = index + 1;
+    let letters = '';
+    while (n > 0) {
+        const r = (n - 1) % 26;
+        letters = String.fromCharCode(65 + r) + letters;
+        n = Math.floor((n - 1) / 26);
+    }
+    return letters;
+}
+
+/** Cap stored wrong values so one garbage cell can't bloat the run document. */
+const MAX_TRACKED_VALUE_CHARS = 100;
+
+/**
+ * Raw cell content for wrong-value tracking: trimmed, capped; undefined when
+ * the cell is empty — an empty cell is missing, never "wrong".
+ */
+export function rawCellText(value: RawCell): string | undefined {
+    if (value === null || value === undefined) {
+        return undefined;
+    }
+    const text =
+        value instanceof Date
+            ? isNaN(value.getTime())
+                ? 'Invalid Date'
+                : value.toISOString().slice(0, 10)
+            : String(value).trim();
+    if (text === '') {
+        return undefined;
+    }
+    return text.length > MAX_TRACKED_VALUE_CHARS ? `${text.slice(0, MAX_TRACKED_VALUE_CHARS)}…` : text;
+}
+
+/**
+ * The {value, column, columnHeader} enrichment that locates a wrong cell in
+ * the source sheet: the raw offending content, the Excel column letter, and
+ * that column's header as written in the file.
+ */
+export function cellTrack(
+    headerRow: RawRow | undefined,
+    index: number | undefined,
+    raw: RawCell
+): Pick<ParseError, 'value' | 'column' | 'columnHeader'> {
+    const track: Pick<ParseError, 'value' | 'column' | 'columnHeader'> = {};
+    const value = rawCellText(raw);
+    if (value !== undefined) {
+        track.value = value;
+    }
+    if (index !== undefined) {
+        track.column = excelColumn(index);
+        const header = headerRow ? rawCellText(headerRow[index]) : undefined;
+        if (header !== undefined) {
+            track.columnHeader = header;
+        }
+    }
+    return track;
+}
+
 /** Accepted normalised header aliases for each canonical field. */
 const HEADER_ALIASES: Record<CanonicalField, string[]> = {
     entity: ['entity'],
@@ -212,8 +272,15 @@ export interface RowResult {
     errors: ParseError[];
 }
 
-/** Normalises one data row into a LedgerPosting, collecting per-row errors. */
-export function normalizeRow(row: RawRow, columns: ColumnIndex, rowNumber: number): RowResult {
+/**
+ * Normalises one data row into a LedgerPosting, collecting per-row errors.
+ * Errors on the engine-critical fields (date, amount, direction, the required
+ * identifiers) exclude the row; a wrong value in an optional column (Vale
+ * Date, FCY/LCY amounts) never does — the row parses and the wrong cell is
+ * tracked with its raw value + column (rowParsed). `headerRow` lets errors
+ * name the source column as written in the file.
+ */
+export function normalizeRow(row: RawRow, columns: ColumnIndex, rowNumber: number, headerRow?: RawRow): RowResult {
     const errors: ParseError[] = [];
     const cell = (field: CanonicalField): RawCell => {
         const idx = columns[field];
@@ -233,6 +300,7 @@ export function normalizeRow(row: RawRow, columns: ColumnIndex, rowNumber: numbe
             field: 'postDate',
             row: rowNumber,
             message: 'Post Date is missing or not a valid date',
+            ...cellTrack(headerRow, columns.postDate, cell('postDate')),
         });
     }
 
@@ -243,6 +311,7 @@ export function normalizeRow(row: RawRow, columns: ColumnIndex, rowNumber: numbe
             field: 'amountBhd',
             row: rowNumber,
             message: 'Amount (BHD) is missing or not a number',
+            ...cellTrack(headerRow, columns.amountBhd, cell('amountBhd')),
         });
     }
 
@@ -258,6 +327,7 @@ export function normalizeRow(row: RawRow, columns: ColumnIndex, rowNumber: numbe
                 field,
                 row: rowNumber,
                 message: `Required value "${field}" is empty`,
+                ...cellTrack(headerRow, columns[field], cell(field)),
             });
         }
     }
@@ -270,7 +340,35 @@ export function normalizeRow(row: RawRow, columns: ColumnIndex, rowNumber: numbe
             field: 'amountBhd',
             row: rowNumber,
             message: 'Amount is zero with no directional log code; cannot classify as debit or credit',
+            ...cellTrack(headerRow, columns.amountBhd, cell('amountBhd')),
         });
+    }
+
+    // Wrong values in optional columns: parse on, track the cell (never drop the row).
+    const tracked: ParseError[] = [];
+    const trackWrong = (field: CanonicalField, code: 'BAD_DATE' | 'BAD_AMOUNT', what: string): void => {
+        const raw = cell(field);
+        if (rawCellText(raw) !== undefined) {
+            tracked.push({
+                code,
+                field,
+                row: rowNumber,
+                message: `${what} — row kept, wrong value tracked`,
+                ...cellTrack(headerRow, columns[field], raw),
+            });
+        }
+    };
+    const valueDate = coerceDate(cell('valueDate'));
+    if (valueDate === undefined) {
+        trackWrong('valueDate', 'BAD_DATE', 'Vale Date is not a valid date');
+    }
+    const amountFcyFils = parseAmountToFils(cell('amountFcy'));
+    if (amountFcyFils === undefined) {
+        trackWrong('amountFcy', 'BAD_AMOUNT', 'Amount (FCY) is not a number');
+    }
+    const amountLcyFils = parseAmountToFils(cell('amountLcy'));
+    if (amountLcyFils === undefined) {
+        trackWrong('amountLcy', 'BAD_AMOUNT', 'Amount (LCY) is not a number');
     }
 
     if (
@@ -283,9 +381,13 @@ export function normalizeRow(row: RawRow, columns: ColumnIndex, rowNumber: numbe
         !currency ||
         !postDate
     ) {
-        return { errors };
+        // Row excluded by a critical error: keep the tracking, without rowParsed.
+        return { errors: [...errors, ...tracked] };
     }
 
+    for (const t of tracked) {
+        t.rowParsed = true;
+    }
     const posting: ParsedPosting = {
         entity: str(cell('entity')) ?? '',
         branchNumber,
@@ -299,13 +401,13 @@ export function normalizeRow(row: RawRow, columns: ColumnIndex, rowNumber: numbe
         accountNumber: str(cell('accountNumber')),
         postDate,
         postTime: str(cell('postTime')),
-        valueDate: coerceDate(cell('valueDate')),
+        valueDate,
         source: str(cell('source')),
         logDescription,
         logCode,
         currency,
-        amountFcyFils: parseAmountToFils(cell('amountFcy')),
-        amountLcyFils: parseAmountToFils(cell('amountLcy')),
+        amountFcyFils,
+        amountLcyFils,
         amountBhdFils,
         amountBhd: filsToBhd(amountBhdFils),
         direction,
@@ -315,7 +417,7 @@ export function normalizeRow(row: RawRow, columns: ColumnIndex, rowNumber: numbe
         username: str(cell('username')),
         rowNumber,
     };
-    return { posting, errors };
+    return { posting, errors: [...errors, ...tracked] };
 }
 
 /** Whether a raw row is entirely empty (all cells blank). */
@@ -403,7 +505,7 @@ export function parseSheets(sheets: SheetRows[]): ParseResult {
                 continue;
             }
             dataRows++;
-            const { posting, errors: rowErrors } = normalizeRow(row, columns, dataRows);
+            const { posting, errors: rowErrors } = normalizeRow(row, columns, dataRows, sheet.rows[headerIndex]);
             for (const err of rowErrors) {
                 errors.push(sheet.name ? { ...err, sheet: sheet.name } : err);
             }
