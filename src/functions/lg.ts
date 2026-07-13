@@ -530,30 +530,37 @@ export async function exportLgRun(request: HttpRequest): Promise<HttpResponseIni
     };
 }
 
-app.http('lg-runs-create', { route: 'lg/runs', methods: ['POST'], authLevel: 'function', handler: createLgRun });
-app.http('lg-runs-list', { route: 'lg/runs', methods: ['GET'], authLevel: 'function', handler: listLgRuns });
-app.http('lg-runs-get', { route: 'lg/runs/{id}', methods: ['GET'], authLevel: 'function', handler: getLgRun });
+// authLevel is 'anonymous' — NOT because these routes are unprotected, but because
+// the SPA (Azure Static Web App) calls this Function App directly at its public URL
+// (VITE_API_BASE points straight at *.azurewebsites.net; there is no SWA managed
+// backend to inject a function key). A browser can't hold a function key, so
+// authLevel:'function' makes the HOST reject every request with an empty-body 401
+// before any handler runs. Identity/role are enforced in-app by requireRole() via
+// the x-user-email header (placeholder until Entra ID — see helpers/auth.ts).
+app.http('lg-runs-create', { route: 'lg/runs', methods: ['POST'], authLevel: 'anonymous', handler: createLgRun });
+app.http('lg-runs-list', { route: 'lg/runs', methods: ['GET'], authLevel: 'anonymous', handler: listLgRuns });
+app.http('lg-runs-get', { route: 'lg/runs/{id}', methods: ['GET'], authLevel: 'anonymous', handler: getLgRun });
 app.http('lg-runs-matched', {
     route: 'lg/runs/{id}/matched',
     methods: ['GET'],
-    authLevel: 'function',
+    authLevel: 'anonymous',
     handler: listLgRunMatched,
 });
 app.http('lg-runs-exceptions', {
     route: 'lg/runs/{id}/exceptions',
     methods: ['GET'],
-    authLevel: 'function',
+    authLevel: 'anonymous',
     handler: listLgRunExceptions,
 });
 app.http('lg-runs-cheques', {
     route: 'lg/runs/{id}/cheques',
     methods: ['GET'],
-    authLevel: 'function',
+    authLevel: 'anonymous',
     handler: listLgRunCheques,
 });
 app.http('lg-runs-export', {
     route: 'lg/runs/{id}/export',
     methods: ['GET'],
-    authLevel: 'function',
+    authLevel: 'anonymous',
     handler: exportLgRun,
 });
