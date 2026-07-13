@@ -112,6 +112,14 @@ describe('POST lg/runs (F1 upload + F9 persistence + F10 auth)', () => {
         expect(run.summary.parsed).toBe(6);
         expect(run.summary.netFils).toBe(0);
         expect(run.errorCount).toBe(0);
+        // GOAL-5: the run carries the per-sheet balance reference and a basis/assessment
+        // for every headline number — saved on the document, not just displayed.
+        expect(run.sheetBalances?.length).toBeGreaterThan(0);
+        expect(run.explanations?.length).toBeGreaterThan(0);
+        for (const f of run.explanations ?? []) {
+            expect(f.basis.length).toBeGreaterThan(0);
+            expect(f.assessment.length).toBeGreaterThan(0);
+        }
         expect(mockAuditCreate).toHaveBeenCalledWith(
             expect.objectContaining({ actor: 'u1', action: 'lg.breakdown.ingested', entityType: 'lgRun', entityId: run.id })
         );

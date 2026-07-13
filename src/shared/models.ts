@@ -585,6 +585,74 @@ export interface LgRunFile {
     bytes: number;
 }
 
+// ---------- GOAL-5: per-sheet balance reference + number provenance ----------
+
+/** What a worksheet contributed to the run (GOAL-5 §per-sheet balance). */
+export type SheetRoleContribution = 'ledger' | 'register' | 'breakdown' | 'skipped';
+
+/**
+ * The balance of all amounts on ONE worksheet — computed at ingest and stored on
+ * the run as an at-a-glance, per-sheet reference (GOAL-5). Answers "what does each
+ * sheet add up to, and does it tie?" without re-opening the source workbook.
+ * All *Fils fields are integer fils; credit/debit are magnitudes, `netFils` is
+ * signed (debit +, credit −).
+ */
+export interface SheetBalance {
+    /** Worksheet name as it appeared in the input ("file › sheet" for multi-file uploads). */
+    sheet: string;
+    /** How this sheet was classified and used. */
+    role: SheetRoleContribution;
+    /** Rows from this sheet that parsed into postings (ledger/breakdown) — the counted population. */
+    parsedRows: number;
+    creditCount: number;
+    debitCount: number;
+    /** Σ |amount| fils of credit postings on this sheet. */
+    creditFils: number;
+    /** Σ |amount| fils of debit postings on this sheet. */
+    debitFils: number;
+    /** creditFils/debitFils signed: Σ (debit − credit) fils — the sheet's net movement. */
+    netFils: number;
+    /** register sheets: cheque rows parsed. */
+    chequeCount?: number;
+    /** register sheets: Σ cheque |amount| fils. */
+    chequeFils?: number;
+    /** ledger sheets that state one: the End Date EoD balance on the sheet's final-day rows, signed fils. */
+    statedEodFils?: number;
+    /** Reviewer-readable note: what this sheet is and how its balance was derived. */
+    basis: string;
+}
+
+/**
+ * One reported number with the story behind it (GOAL-5). Every headline figure the
+ * run surfaces carries a `basis` (HOW it was derived — the formula/source) and an
+ * `assessment` (WHY it matters / what a reviewer should conclude). Stored on the run
+ * and rendered next to the number so no figure is unexplained.
+ */
+export interface ExplainedFigure {
+    /** Stable machine key, e.g. 'glBalance', 'sumCredits', 'residual'. */
+    key: string;
+    /** Human label, e.g. "GL closing balance". */
+    label: string;
+    /** Signed integer fils for money figures; omitted for pure counts. */
+    valueFils?: number;
+    /** Raw integer for count figures (rows, cheques, branches). */
+    count?: number;
+    /** Pre-formatted display string (BHD 3-dp with sign, or the integer). */
+    display: string;
+    /** HOW the number was derived — the formula or source. */
+    basis: string;
+    /** WHY it matters / what it means for the reconciliation — the reviewer assessment. */
+    assessment: string;
+    /** Keys of the component figures this one is derived from (drill-through). */
+    inputs?: string[];
+    /** Display grouping. */
+    group: 'input' | 'balance' | 'matching' | 'reconciliation' | 'exceptions' | 'sheet';
+    /** Set for per-sheet figures. */
+    sheet?: string;
+    /** True when this figure signals a control break a reviewer must act on. */
+    flag?: boolean;
+}
+
 /**
  * A persisted reconciliation run (GOAL.md §4 F9): the uploaded breakdown's identity
  * (hash), parse summary and errors, plus the F3 balances and F4 matching results
@@ -637,6 +705,12 @@ export interface LgRun extends BaseDocument {
     chequesByState?: Partial<Record<ChequeState, number>>;
     /** Cheques with no issuance credit in the ledger window (legacy population). */
     preWindowChequeCount?: number;
+
+    // ---- GOAL-5: per-sheet balance reference + number provenance ----
+    /** Balance of all amounts per worksheet — the saved reference (GOAL-5). */
+    sheetBalances?: SheetBalance[];
+    /** Description/assessment of how every headline number was derived and why (GOAL-5). */
+    explanations?: ExplainedFigure[];
 }
 
 /** BHD (and the sample data) use 3 decimal places. */

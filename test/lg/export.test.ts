@@ -1,7 +1,7 @@
 import * as ExcelJS from 'exceljs';
 import { computeBranchBalances } from '../../src/lg/balance';
 import { detectExceptions } from '../../src/lg/exceptions';
-import { buildStatementWorkbook, fmtBhd, fmtIsoDate, MISMATCHED_SHEET, STATEMENT_SHEET } from '../../src/lg/export';
+import { BALANCES_SHEET, buildStatementWorkbook, fmtBhd, fmtIsoDate, MISMATCHED_SHEET, STATEMENT_SHEET } from '../../src/lg/export';
 import { matchPostings } from '../../src/lg/match';
 import { reconcile } from '../../src/lg/reconcile';
 import { LgRun } from '../../src/shared/models';
@@ -48,7 +48,7 @@ describe('buildStatementWorkbook (G5) — golden-file layout', () => {
         const workbook = await loadWorkbook(await buildStatementWorkbook(run, recon, exceptions));
 
         // Sheet names — statement first, mismatched second (§2.3).
-        expect(workbook.worksheets.map((w) => w.name)).toEqual([STATEMENT_SHEET, MISMATCHED_SHEET]);
+        expect(workbook.worksheets.map((w) => w.name)).toEqual([STATEMENT_SHEET, MISMATCHED_SHEET, BALANCES_SHEET]);
 
         const ws = workbook.getWorksheet(STATEMENT_SHEET)!;
         // Title + identity block.
@@ -160,7 +160,7 @@ describe('buildStatementWorkbook — register mode (GOAL-3 R9)', () => {
     it('fills the statement with real cheque attributes and the decomposed block', async () => {
         const { run, recon, exceptions, outcomes } = await buildRegisterRun();
         const workbook = await loadWorkbook(await buildStatementWorkbook(run, recon, exceptions, outcomes));
-        expect(workbook.worksheets.map((w) => w.name)).toEqual([STATEMENT_SHEET, MISMATCHED_SHEET]);
+        expect(workbook.worksheets.map((w) => w.name)).toEqual([STATEMENT_SHEET, MISMATCHED_SHEET, BALANCES_SHEET]);
 
         const ws = workbook.getWorksheet(STATEMENT_SHEET)!;
         expect(ws.getCell('A2').value).toBe('Branch: (all branches)');
@@ -220,5 +220,63 @@ describe('buildStatementWorkbook — register mode (GOAL-3 R9)', () => {
         expect(ws.getCell('C13').value).toBe('0.000');
         expect(ws.getCell('E17').value).toBe('1009');
         expect(ws.getCell('C18').value).toBe('45.000');
+    });
+});
+
+describe('appendBalancesBasisSheet (GOAL-5) — per-sheet balances & number basis saved to the workbook', () => {
+    it('adds a Balances & Basis sheet with the per-sheet table and every figure basis + assessment', async () => {
+        const { run, recon, exceptions } = buildFixtureRun();
+        // Attach the GOAL-5 reference data the way ingest stores it on the run.
+        run.sheetBalances = [
+            {
+                sheet: 'Credit',
+                role: 'ledger',
+                parsedRows: 3,
+                creditCount: 3,
+                debitCount: 0,
+                creditFils: 10_000,
+                debitFils: 0,
+                netFils: -10_000,
+                statedEodFils: -2_000,
+                basis: 'Ledger extract: 3 postings — Σ credits BHD 10.000.',
+            },
+        ];
+        run.explanations = [
+            {
+                key: 'glBalance',
+                label: 'GL closing balance',
+                valueFils: -2_000,
+                display: 'BHD -2.000',
+                basis: 'The stated End Date EoD Balance.',
+                assessment: 'The control total the reconciliation must tie to.',
+                group: 'balance',
+            },
+            {
+                key: 'residual',
+                label: 'Unexplained residual',
+                valueFils: -500,
+                display: 'BHD -0.500',
+                basis: 'Difference after removing classified exceptions.',
+                assessment: '0.500 is unexplained — investigate before sign-off.',
+                group: 'reconciliation',
+                flag: true,
+            },
+        ];
+
+        const workbook = await loadWorkbook(await buildStatementWorkbook(run, recon, exceptions));
+        expect(workbook.worksheets.map((w) => w.name)).toContain(BALANCES_SHEET);
+
+        const ws = workbook.getWorksheet(BALANCES_SHEET)!;
+        const all: string[] = [];
+        ws.eachRow((row) => row.eachCell((cell) => all.push(String(cell.value))));
+
+        // Per-sheet balance row is present with its net and stated EoD.
+        expect(all).toContain('Credit');
+        expect(all).toContain('GL ledger');
+        // Both a figure's basis (how) and assessment (why) travel into the workbook.
+        expect(all).toContain('The stated End Date EoD Balance.');
+        expect(all).toContain('The control total the reconciliation must tie to.');
+        // Flagged figures carry the warning marker.
+        expect(all).toContain('⚠');
     });
 });

@@ -32,6 +32,8 @@ import { reconcile } from '../lg/reconcile';
 import { classifyRegisterExceptions } from '../lg/registerExceptions';
 import { matchRegister } from '../lg/registerMatch';
 import { extractStatedBalance, reconcileRegister } from '../lg/registerReconcile';
+import { computeSheetBalances } from '../lg/sheetBalances';
+import { explainRun } from '../lg/provenance';
 import {
     ChequeOutcome,
     ChequeState,
@@ -300,6 +302,24 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         }
     }
 
+    // GOAL-5: per-sheet balance reference + a plain-language basis/assessment for
+    // every headline number. Both are derived from figures already computed above
+    // (they never re-derive money), so they tie to the screen by construction and
+    // are saved on the run as the reviewer's reference.
+    const sheetBalances = computeSheetBalances(result);
+    const explanations = explainRun({
+        mode: result.mode,
+        summary: result.summary,
+        asOf,
+        balances,
+        sheetBalances,
+        reconciliation,
+        matching: match?.summary,
+        exceptionsSummary: exceptions?.summary,
+        chequeCount: registerFields?.chequeCount,
+        chequesByState: registerFields?.chequesByState,
+    });
+
     // Input identity (GOAL.md §5 determinism). Single file: hash of the raw bytes,
     // unchanged from pre-multi-file runs. Multi-file: hash of the SORTED per-file
     // hashes, so the same set of files dedupes regardless of upload order.
@@ -360,6 +380,8 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         matchedSetCount: match ? match.matchedSets.length : 0,
         exceptionCount: exceptions ? exceptions.summary.total : 0,
         exceptionsSummary: exceptions?.summary,
+        sheetBalances,
+        explanations,
         ...registerFields,
     });
     await recordAudit(user.id, 'lg.breakdown.ingested', 'lgRun', run.id, {
@@ -376,6 +398,8 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         exceptionCount: exceptions ? exceptions.summary.total : 0,
         chequeCount: registerFields?.chequeCount,
         balanced: reconciliation?.balanced,
+        sheetCount: sheetBalances.length,
+        explainedFigureCount: explanations.length,
         duplicateOf: duplicates[0]?.id,
     });
     return created(run);

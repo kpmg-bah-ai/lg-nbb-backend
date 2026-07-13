@@ -19,7 +19,16 @@
  */
 
 import * as ExcelJS from 'exceljs';
-import { BranchReconciliation, ChequeOutcome, LgException, LgExceptionReason, LgRun } from '../shared/models';
+import {
+    BranchReconciliation,
+    ChequeOutcome,
+    ExplainedFigure,
+    LgException,
+    LgExceptionReason,
+    LgRun,
+    SheetBalance,
+    SheetRoleContribution,
+} from '../shared/models';
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -61,6 +70,97 @@ export const EXC_TYPE_LABEL: Record<LgExceptionReason, string> = {
 
 export const STATEMENT_SHEET = 'MCQ+OLD ITEM';
 export const MISMATCHED_SHEET = 'Mismatched';
+export const BALANCES_SHEET = 'Balances & Basis';
+
+const SHEET_ROLE_LABEL: Record<SheetRoleContribution, string> = {
+    ledger: 'GL ledger',
+    breakdown: 'GL breakdown',
+    register: 'Cheque register',
+    skipped: 'Skipped',
+};
+
+const FIGURE_GROUP_LABEL: Record<ExplainedFigure['group'], string> = {
+    input: 'Input population',
+    balance: 'GL balance',
+    matching: 'Matching',
+    reconciliation: 'Reconciliation',
+    exceptions: 'Exceptions',
+    sheet: 'Per-sheet',
+};
+
+/**
+ * GOAL-5: the reference sheet. Two tables saved into the exported workbook so the
+ * balance-per-sheet and the how/why behind every number travel WITH the statement:
+ *   1. Per-sheet balances — each worksheet's Σ credits / Σ debits / net (+ stated EoD).
+ *   2. Explained figures — every headline number with its basis (how) and assessment (why).
+ */
+export function appendBalancesBasisSheet(workbook: ExcelJS.Workbook, run: LgRun): void {
+    const ws = workbook.addWorksheet(BALANCES_SHEET);
+    ws.columns = [28, 16, 10, 18, 18, 18, 18, 70].map((width) => ({ width }));
+
+    ws.getCell('A1').value = 'Per-Sheet Balances & Number Basis (reference)';
+    ws.getCell('A1').font = { bold: true, size: 13 };
+    ws.getCell('A2').value = `Input: ${run.filename ?? '(unnamed)'}  ·  Review Date: ${fmtIsoDate(
+        run.reconciliation?.asOf ?? run.asOf ?? ''
+    )}  ·  SHA-256: ${(run.inputSha256 ?? '').slice(0, 12)}…`;
+
+    // ── Table 1: per-sheet balances ───────────────────────────────────────────
+    let row = 4;
+    ws.getCell(`A${row}`).value = 'Balance of all amounts, per worksheet';
+    ws.getCell(`A${row}`).font = { bold: true };
+    row++;
+    const balHeaders = ['Worksheet', 'Role', 'Rows', 'Σ Credits (BHD)', 'Σ Debits (BHD)', 'Net (BHD)', 'Stated EoD (BHD)', 'Basis'];
+    ws.getRow(row).values = balHeaders;
+    ws.getRow(row).font = { bold: true };
+    row++;
+    const sheetBalances: SheetBalance[] = run.sheetBalances ?? [];
+    for (const sb of sheetBalances) {
+        ws.getRow(row).values = [
+            sb.sheet,
+            SHEET_ROLE_LABEL[sb.role],
+            sb.role === 'register' ? (sb.chequeCount ?? 0) : sb.parsedRows,
+            sb.role === 'register' ? '' : fmtBhd(sb.creditFils),
+            sb.role === 'register' ? '' : fmtBhd(sb.debitFils),
+            sb.role === 'register' ? fmtBhd(sb.chequeFils ?? 0) : fmtBhd(sb.netFils),
+            sb.statedEodFils !== undefined ? fmtBhd(sb.statedEodFils) : '',
+            sb.basis,
+        ];
+        row++;
+    }
+    if (sheetBalances.length === 0) {
+        ws.getCell(`A${row}`).value = '(no per-sheet balances recorded for this run)';
+        row++;
+    }
+
+    // ── Table 2: explained figures (basis + assessment) ───────────────────────
+    row += 1;
+    ws.getCell(`A${row}`).value = 'Every reported number — how we got it, and why it matters';
+    ws.getCell(`A${row}`).font = { bold: true };
+    row++;
+    ws.getRow(row).values = ['Figure', 'Value', 'Flag', 'Group', 'Basis (how)', '', '', 'Assessment (why)'];
+    ws.getRow(row).font = { bold: true };
+    // The Basis column spans B..G visually; keep header in E for clarity.
+    row++;
+    for (const f of run.explanations ?? []) {
+        ws.getRow(row).values = [
+            f.label,
+            f.display,
+            f.flag ? '⚠' : '',
+            FIGURE_GROUP_LABEL[f.group],
+            f.basis,
+            '',
+            '',
+            f.assessment,
+        ];
+        if (f.flag) {
+            ws.getRow(row).font = { bold: true };
+        }
+        row++;
+    }
+    if ((run.explanations ?? []).length === 0) {
+        ws.getCell(`A${row}`).value = '(no explained figures recorded for this run)';
+    }
+}
 
 /**
  * GOAL-3 R9: the register-mode statement. Line items are the OUTSTANDING
@@ -222,6 +322,7 @@ export async function buildStatementWorkbook(
     if (isRegister) {
         buildRegisterStatement(workbook.addWorksheet(STATEMENT_SHEET), recon, outcomes!, reviewDate, branchFilter);
         appendExceptionSheet(workbook, branchExceptions);
+        appendBalancesBasisSheet(workbook, run);
         const bytes = await workbook.xlsx.writeBuffer();
         return Buffer.from(bytes as ArrayBuffer);
     }
@@ -313,6 +414,7 @@ export async function buildStatementWorkbook(
     ws.getCell(`B${row}`).font = { bold: true };
 
     appendExceptionSheet(workbook, branchExceptions);
+    appendBalancesBasisSheet(workbook, run);
 
     const bytes = await workbook.xlsx.writeBuffer();
     return Buffer.from(bytes as ArrayBuffer);
