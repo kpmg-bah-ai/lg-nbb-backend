@@ -1,13 +1,15 @@
 import * as ExcelJS from 'exceljs';
 import { computeBranchBalances } from '../../src/lg/balance';
 import { detectExceptions } from '../../src/lg/exceptions';
-import { BALANCES_SHEET, buildStatementWorkbook, fmtBhd, fmtIsoDate, MISMATCHED_SHEET, STATEMENT_SHEET } from '../../src/lg/export';
+import { BALANCES_SHEET, buildStatementWorkbook, fmtBhd, fmtIsoDate, MISMATCHED_SHEET } from '../../src/lg/export';
 import { matchPostings } from '../../src/lg/match';
 import { reconcile } from '../../src/lg/reconcile';
-import { LgRun } from '../../src/shared/models';
+import { GL_CATALOG, LgRun } from '../../src/shared/models';
 import { makePosting } from './helpers';
 
 const ASOF = '2026-06-30';
+const TCS_LABELS = GL_CATALOG.D2810085.statementLabels;
+const MGR_LABELS = GL_CATALOG['99801000'].statementLabels;
 
 /**
  * Runs the full engine over crafted postings the way ingest does, so the export
@@ -29,6 +31,7 @@ function buildFixtureRun() {
     const { exceptions } = detectExceptions(match.outstanding);
     const run = {
         id: 'run-golden',
+        glCode: 'D2810085',
         asOf: ASOF,
         reconciliation,
         matching: match.summary,
@@ -43,47 +46,65 @@ async function loadWorkbook(buffer: Buffer): Promise<ExcelJS.Workbook> {
 }
 
 describe('buildStatementWorkbook (G5) — golden-file layout', () => {
-    it('produces the two sheets of GOAL.md §2.3 with the reference layout and tying figures', async () => {
+    it('produces the two sheets of GOAL.md §2.3 with the TCS fragment layout and tying figures', async () => {
         const { run, recon, exceptions } = buildFixtureRun();
         const workbook = await loadWorkbook(await buildStatementWorkbook(run, recon, exceptions));
 
-        // Sheet names — statement first, mismatched second (§2.3).
-        expect(workbook.worksheets.map((w) => w.name)).toEqual([STATEMENT_SHEET, MISMATCHED_SHEET, BALANCES_SHEET]);
+        // Sheet names — statement first, mismatched second (§2.3); TCS-named from the catalog.
+        expect(workbook.worksheets.map((w) => w.name)).toEqual([TCS_LABELS.sheetName, MISMATCHED_SHEET, BALANCES_SHEET]);
 
-        const ws = workbook.getWorksheet(STATEMENT_SHEET)!;
+        const ws = workbook.getWorksheet(TCS_LABELS.sheetName)!;
         // Title + identity block.
-        expect(ws.getCell('A1').value).toBe('GL Reconciliation — Outstanding Items Statement');
+        expect(ws.getCell('A1').value).toBe(TCS_LABELS.statementTitle);
         expect(ws.getCell('A2').value).toBe('Branch: 1');
         expect(ws.getCell('A3').value).toBe('Entity: BH  ·  GL: D2810085  ·  Review Date: 30 Jun 2026');
 
-        // Reconciliation block — labels exactly as the reference sample (incl. the sic).
+        // Reconciliation block — labels; total label comes from the catalog.
         expect(ws.getCell('K2').value).toBe('GL Balance');
         expect(ws.getCell('L2').value).toBe(fmtBhd(recon.glBalanceFils));
         expect(ws.getCell('L2').value).toBe('46.500'); // 125.000 DR − 78.500 CR
-        expect(ws.getCell('K3').value).toBe('Total (OLD Item + MCQ)');
+        expect(ws.getCell('K3').value).toBe(TCS_LABELS.totalLabel);
         expect(ws.getCell('L3').value).toBe('203.500'); // 125.000 + 78.500 (Σ|outstanding|)
         expect(ws.getCell('K4').value).toBe('Diffrence');
         expect(ws.getCell('L4').value).toBe('0.000');
         expect(ws.getCell('K5').value).toBe('Status');
         expect(ws.getCell('L5').value).toBe('Balanced');
 
-        // Section A — Old Items.
-        expect(ws.getCell('A7').value).toBe("Old Items Outstanding – Old Manager's Checks");
+        // Section A — aged fragments in fragment columns (GOAL-7: TCS never in cheque columns).
+        expect(ws.getCell('A7').value).toBe(TCS_LABELS.oldTitle);
         expect(ws.getCell('A8').value).toBe('No.');
         expect(ws.getCell('B8').value).toBe('Amount (BHD)');
-        expect(ws.getCell('F8').value).toBe('Date of Transfer to Old Items');
+        expect(ws.getCell('C8').value).toBe('Post Date');
+        expect(ws.getCell('D8').value).toBe('Account Number');
+        expect(ws.getCell('E8').value).toBe('Journal Number');
+        expect(ws.getCell('F8').value).toBe('Log Code');
+        expect(ws.getCell('G8').value).toBe('DR/CR');
         expect(ws.getCell('B9').value).toBe('125.000'); // the old unmatched debit
         expect(ws.getCell('C9').value).toBe('10 Jan 2022');
-        expect(ws.getCell('H9').value).toBe('ACC-OLD');
+        expect(ws.getCell('D9').value).toBe('ACC-OLD');
+        expect(ws.getCell('E9').value).toBe('J-OLD');
+        expect(ws.getCell('G9').value).toBe('DEBIT');
         expect(ws.getCell('A10').value).toBe('Subtotal');
         expect(ws.getCell('B10').value).toBe(fmtBhd(recon.oldFils));
 
-        // Section B — current outstanding.
-        expect(ws.getCell('A12').value).toBe('Outstanding MCQ  (Less than 1 year)');
+        // Section B — current fragments.
+        expect(ws.getCell('A12').value).toBe(TCS_LABELS.currentTitle);
         expect(ws.getCell('A13').value).toBe('No.');
         expect(ws.getCell('B14').value).toBe('78.500'); // the current unmatched credit
         expect(ws.getCell('A15').value).toBe('Subtotal');
         expect(ws.getCell('B15').value).toBe(fmtBhd(recon.currentFils));
+    });
+
+    it('TCS statement carries no cheque columns and no MCQ wording (GOAL-7 §6)', async () => {
+        const { run, recon, exceptions } = buildFixtureRun();
+        const workbook = await loadWorkbook(await buildStatementWorkbook(run, recon, exceptions));
+        const ws = workbook.getWorksheet(TCS_LABELS.sheetName)!;
+        const cells: string[] = [];
+        ws.eachRow((r) => r.eachCell((c) => cells.push(String(c.value ?? ''))));
+        for (const forbidden of ['CHQ. #', 'Remitting Bank', 'Date of Transfer to Old Items', 'Debit Account']) {
+            expect(cells).not.toContain(forbidden);
+        }
+        expect(cells.some((c) => c.includes('MCQ'))).toBe(false);
     });
 
     it('lists every exception on the Mismatched sheet — an unmatched debit is always there', async () => {
@@ -112,7 +133,7 @@ describe('buildStatementWorkbook (G5) — golden-file layout', () => {
         // Simulate an externally supplied balance 1 BHD off (GOAL.md §9.6).
         const skewed = { ...recon, glBalanceFils: recon.glBalanceFils + 1000, differenceFils: 1000, balanced: false };
         const workbook = await loadWorkbook(await buildStatementWorkbook(run, skewed, exceptions));
-        const ws = workbook.getWorksheet(STATEMENT_SHEET)!;
+        const ws = workbook.getWorksheet(TCS_LABELS.sheetName)!;
 
         expect(ws.getCell('L4').value).toBe('1.000'); // never rounded away
         expect(ws.getCell('L5').value).toBe('Not Balanced');
@@ -150,6 +171,7 @@ describe('buildStatementWorkbook — register mode (GOAL-3 R9)', () => {
         const run = {
             id: 'run-register',
             mode: 'register',
+            glCode: '99801000',
             asOf: AS_OF,
             reconciliation,
             matching: match.summary,
@@ -160,9 +182,9 @@ describe('buildStatementWorkbook — register mode (GOAL-3 R9)', () => {
     it('fills the statement with real cheque attributes and the decomposed block', async () => {
         const { run, recon, exceptions, outcomes } = await buildRegisterRun();
         const workbook = await loadWorkbook(await buildStatementWorkbook(run, recon, exceptions, outcomes));
-        expect(workbook.worksheets.map((w) => w.name)).toEqual([STATEMENT_SHEET, MISMATCHED_SHEET, BALANCES_SHEET]);
+        expect(workbook.worksheets.map((w) => w.name)).toEqual([MGR_LABELS.sheetName, MISMATCHED_SHEET, BALANCES_SHEET]);
 
-        const ws = workbook.getWorksheet(STATEMENT_SHEET)!;
+        const ws = workbook.getWorksheet(MGR_LABELS.sheetName)!;
         expect(ws.getCell('A2').value).toBe('Branch: (all branches)');
 
         // The decomposed GL-level block — Task-1 numbers exactly.
@@ -211,7 +233,7 @@ describe('buildStatementWorkbook — register mode (GOAL-3 R9)', () => {
     it('?branch narrows the sections and recomputes their subtotals; the block stays GL-level', async () => {
         const { run, recon, exceptions, outcomes } = await buildRegisterRun();
         const workbook = await loadWorkbook(await buildStatementWorkbook(run, recon, exceptions, outcomes, '002'));
-        const ws = workbook.getWorksheet(STATEMENT_SHEET)!;
+        const ws = workbook.getWorksheet(MGR_LABELS.sheetName)!;
         expect(ws.getCell('A2').value).toBe('Branch: 002');
         expect(String(ws.getCell('A4').value)).toMatch(/GL-level/);
         expect(ws.getCell('L2').value).toBe('2,730.000'); // block untouched

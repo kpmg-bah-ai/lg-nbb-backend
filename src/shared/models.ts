@@ -271,7 +271,10 @@ export type ParseErrorCode =
     | 'AMBIGUOUS_DIRECTION' // both amount columns non-zero on one ledger-statement row
     | 'MIXED_MODE' // breakdown and register families in one workbook — rejected
     | 'INCOMPLETE_REGISTER_INPUT' // register without ledger sheets (or vice versa)
-    | 'INCONSISTENT_STATED_BALANCE'; // final-day rows disagree on End Date EoD Balance
+    | 'INCONSISTENT_STATED_BALANCE' // final-day rows disagree on End Date EoD Balance
+    // GOAL-7 GL catalog:
+    | 'UNKNOWN_GL' // the picked GL code (or a GL value in the rows) is not in the catalog
+    | 'GL_MISMATCH'; // the upload's family or embedded GL code contradicts the picked GL
 
 // ParseError/ParseSummary/ParseResult are value objects embedded in an LgRun (or held
 // in memory) — they are never stored as standalone documents, so no BaseDocument.
@@ -480,6 +483,181 @@ export type LgExceptionReason =
     | 'REGISTER_LAG_OPS_PAID' // ops-PAID but register still unmatched (statement excludes)
     | 'KEY_COLLISION' // informational: key bucket shared by several instruments/legs
     | 'EXTRACT_GAP'; // run-level: derived balance ≠ stated EoD balance
+
+// ---------- GOAL-7: GL catalog ----------
+
+/** Canonical GL codes the app knows — the discriminant persisted on LgRun.glCode. */
+export type GlCode = '99801000' | 'D2810085';
+
+/** How the dashboard scopes a GL's statement (GOAL-7 "Two scoping concepts"). */
+export type GlBranchNav = 'branchSections' | 'consolidated';
+
+/**
+ * One first-class GL. Everything mode-, layout- or copy-specific hangs off this
+ * definition so adding a GL is a catalog entry + a GL_UI entry — never a new screen.
+ * Facts are lifted from the GOAL-6 docs (GL-99801000-MC-PAYABLE.md /
+ * GL-D2810085-TCS-SWIFT.md); update those docs first, then this seed.
+ */
+export interface GlDefinition {
+    code: GlCode;
+    /** Spellings that identify this GL in source files (resolved via resolveGlCode). */
+    codeVariants: string[];
+    name: string;
+    shortName: string;
+    /** Parsing family this GL's uploads must resolve to (detect.ts). */
+    mode: LgRunMode;
+    /** Worksheet roles an upload must contain (resolveMode already enforces the combination). */
+    requiredSheetRoles: SheetRole[];
+    /** Header fingerprint that identifies this GL's sheets — documents detect.ts, asserted in tests. */
+    fingerprint: string[];
+    entity: string;
+    currency: string;
+    branchNav: GlBranchNav;
+    /** DR/CR derivation: split Credit/Debit amount columns vs the sign of one amount column. */
+    directionModel: 'columnSplit' | 'amountSign';
+    /** Two-legged GL↔register key matching vs per-account FIFO offsetting. */
+    matchModel: 'registerTwoLegged' | 'fifoByAccount';
+    /** Stated-EoD with gap/residual decomposition vs derived == stated tie-out. */
+    balanceModel: 'statedEodDecomposition' | 'derivedEqualsStated';
+    /** Statement layout key — resolved by the frontend GL_UI registry and the export labels. */
+    statement: 'chequeTwoSection' | 'suspenseFragments';
+    /** Exception reasons this GL's pipeline can emit (drives UI badge subsets + tests). */
+    exceptionReasons: LgExceptionReason[];
+    /** Data sentinels the parsers honour. Empty object = none: absence expresses "missing". */
+    sentinels: {
+        neverPaidDate?: string;
+        takeOnJournal?: string;
+        noRegisterHitChequeNumber?: string;
+    };
+    /** Source column headers treated as PII for this GL (browser sanitizer + upload copy). */
+    piiColumns: string[];
+    /** Export workbook labels (lg/export.ts) — the de-hardcoded 'MCQ+OLD ITEM' family. */
+    statementLabels: {
+        sheetName: string;
+        statementTitle: string;
+        oldTitle: string;
+        currentTitle: string;
+        totalLabel: string;
+    };
+}
+
+export const GL_CATALOG: Record<GlCode, GlDefinition> = {
+    '99801000': {
+        code: '99801000',
+        codeVariants: ['99801000', '0099801000', '0000000099801000'],
+        name: "MC PAYABLE — Manager's Cheques",
+        shortName: 'MGR 99801000',
+        mode: 'register',
+        requiredSheetRoles: ['ledgerStatement', 'register'],
+        fingerprint: ['Branch', 'Transaction Credit Amount', 'Transaction Debit Amount', 'c0_bank_code…c60'],
+        entity: 'BH',
+        currency: 'BHD',
+        branchNav: 'branchSections',
+        directionModel: 'columnSplit',
+        matchModel: 'registerTwoLegged',
+        balanceModel: 'statedEodDecomposition',
+        statement: 'chequeTwoSection',
+        exceptionReasons: [
+            'NON_ISSUANCE_CREDIT',
+            'UNRESOLVED_BATCH_DEBIT',
+            'UNMATCHED_LEDGER_DEBIT',
+            'REGISTER_PAID_NO_LEDGER_DEBIT',
+            'REGISTER_LAG_OPS_PAID',
+            'KEY_COLLISION',
+            'EXTRACT_GAP',
+        ],
+        sentinels: {
+            neverPaidDate: '1901-01-01',
+            takeOnJournal: '999999999',
+            noRegisterHitChequeNumber: '0',
+        },
+        // GL-99801000-MC-PAYABLE.md §8 "PII surface".
+        piiColumns: [
+            'Teller',
+            'Detailed Description',
+            'c10_payee_name',
+            'c11_memb_no',
+            'c14_issued_teller',
+            'c22_matchd_teller',
+            'c37_purchaser_name',
+            'c38_beneficiary_name',
+            'c39_beneficiary_adrs',
+            'c43_beneficiary_id_no',
+            'c44_beneficiary_tel_no',
+            'c46_chqm_pur_name_2',
+            'c51_issued_supvisor',
+            'c57_applicant_tel_no',
+            'RRN',
+            'Card Number',
+        ],
+        statementLabels: {
+            sheetName: 'MCQ+OLD ITEM',
+            statementTitle: "GL Reconciliation — Outstanding Manager's Cheques (register-based)",
+            oldTitle: "Old Items Outstanding – Old Manager's Checks",
+            currentTitle: 'Outstanding MCQ  (Less than 1 year)',
+            totalLabel: 'Total (OLD Item + MCQ)',
+        },
+    },
+    D2810085: {
+        code: 'D2810085',
+        codeVariants: ['D2810085', '2810085'],
+        name: 'Inter System Account — SWIFT (TCS)',
+        shortName: 'TCS D2810085',
+        mode: 'breakdown',
+        requiredSheetRoles: ['breakdown'],
+        fingerprint: ['Branch Number', 'Amount (BHD)'],
+        entity: 'BH',
+        currency: 'BHD',
+        branchNav: 'consolidated',
+        directionModel: 'amountSign',
+        matchModel: 'fifoByAccount',
+        balanceModel: 'derivedEqualsStated',
+        statement: 'suspenseFragments',
+        exceptionReasons: [
+            'UNMATCHED_DEBIT',
+            'UNMATCHED_CREDIT',
+            'PARTIALLY_MATCHED_DEBIT',
+            'PARTIALLY_MATCHED_CREDIT',
+            'DUPLICATE',
+            'AMOUNT_MISMATCH',
+        ],
+        sentinels: {},
+        // GL-D2810085-TCS-SWIFT.md §5 "PII surface".
+        piiColumns: ['Account Number', 'User ID', 'Username'],
+        statementLabels: {
+            sheetName: 'SUSPENSE OUTSTANDING',
+            statementTitle: 'GL Reconciliation — Outstanding Suspense Fragments (FIFO)',
+            oldTitle: 'Old Items Outstanding – Aged Suspense Fragments',
+            currentTitle: 'Outstanding Fragments  (Less than 1 year)',
+            totalLabel: 'Total (Old + Current Fragments)',
+        },
+    },
+};
+
+/** Normalises a GL spelling: trim, uppercase, strip leading zeros from all-digit text. */
+export function normalizeGlText(text: string): string {
+    const t = text.trim().toUpperCase();
+    return /^\d+$/.test(t) ? t.replace(/^0+(?=\d)/, '') : t;
+}
+
+/** Resolves any documented spelling ('0000000099801000', '2810085', …) to its catalog code. */
+export function resolveGlCode(text: string | undefined | null): GlCode | undefined {
+    if (!text) {
+        return undefined;
+    }
+    const norm = normalizeGlText(String(text));
+    for (const def of Object.values(GL_CATALOG)) {
+        if (def.codeVariants.some((v) => normalizeGlText(v) === norm)) {
+            return def.code;
+        }
+    }
+    return undefined;
+}
+
+/** GL of a stored run; legacy pre-GOAL-7 runs derive from their mode (GOAL-3 default: breakdown). */
+export function glCodeOf(run: Pick<LgRun, 'glCode' | 'mode'>): GlCode {
+    return run.glCode ?? (run.mode === 'register' ? '99801000' : 'D2810085');
+}
 
 /**
  * A reconciling exception: every outstanding item becomes exactly one exception
@@ -700,6 +878,9 @@ export interface LgRun extends BaseDocument {
     // ---- GOAL-3 register family ----
     /** Input family; runs stored before GOAL-3 have no mode and are breakdown runs. */
     mode?: LgRunMode;
+    // ---- GOAL-7 GL catalog ----
+    /** Which catalog GL the user picked at upload; legacy runs derive via glCodeOf(). */
+    glCode?: GlCode;
     /** Register rows parsed (outcomes live in `lgRunDetails` kind 'cheques', capped). */
     chequeCount?: number;
     chequesByState?: Partial<Record<ChequeState, number>>;
