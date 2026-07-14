@@ -26,6 +26,7 @@ import { badRequest, created, error, json, notFound } from '../helpers/json';
 import { computeBranchBalances, deriveAsOf } from '../lg/balance';
 import { detectExceptions } from '../lg/exceptions';
 import { buildStatementWorkbook } from '../lg/export';
+import { validateGlUpload } from '../lg/glGuard';
 import { detectFormat, ingestFiles } from '../lg/ingest';
 import { matchPostings } from '../lg/match';
 import { reconcile } from '../lg/reconcile';
@@ -38,6 +39,7 @@ import {
     ChequeOutcome,
     ChequeState,
     ExceptionSummary,
+    GL_CATALOG,
     LgException,
     LgRun,
     LgRunDetailChunk,
@@ -47,6 +49,7 @@ import {
     OutstandingItem,
     ParseError,
     Reconciliation,
+    resolveGlCode,
 } from '../shared/models';
 
 /** Cosmos documents are capped at 2MB — store only the first errors plus the total count. */
@@ -180,6 +183,8 @@ const REJECT_CODES = new Set([
     'UNSUPPORTED_FORMAT',
     'MIXED_MODE',
     'INCOMPLETE_REGISTER_INPUT',
+    'UNKNOWN_GL',
+    'GL_MISMATCH',
 ]);
 
 interface Upload {
@@ -221,6 +226,24 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
     if (asOfParam && !isIsoDate(asOfParam)) {
         return badRequest('asOf must be a valid ISO date (yyyy-mm-dd)');
     }
+    // GOAL-7: which catalog GL the user picked. Mandatory — the picker sends it.
+    // Validated cheaply, before the (potentially large) upload is read.
+    const glParam = request.query.get('gl');
+    if (!glParam) {
+        return badRequest(`Pass ?gl= with the GL picked at upload (one of: ${Object.keys(GL_CATALOG).join(', ')})`);
+    }
+    const glCode = resolveGlCode(glParam);
+    if (!glCode) {
+        return error(422, `GL "${glParam}" is not in the GL catalog`, {
+            errors: [
+                {
+                    code: 'UNKNOWN_GL',
+                    message: `GL "${glParam}" is not in the GL catalog — known GLs: ${Object.keys(GL_CATALOG).join(', ')}`,
+                },
+            ],
+        });
+    }
+    const glDef = GL_CATALOG[glCode];
     let uploads: Upload[];
     try {
         uploads = await readUpload(request);
@@ -254,6 +277,12 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
     // Header/file-level problems mean no rows were mapped — reject rather than store an empty run (F1).
     if (result.errors.some((e) => REJECT_CODES.has(e.code))) {
         return error(422, 'The file is not a recognisable transaction breakdown', { errors: result.errors });
+    }
+
+    // GOAL-7 §3: the upload must BE the GL the user said it is (family + embedded GL code).
+    const glErrors = validateGlUpload(glDef, result);
+    if (glErrors.length > 0) {
+        return error(422, 'The upload does not match the picked GL', { errors: glErrors });
     }
 
     // F3 + F4 run at ingest, while the postings are in memory (they are not persisted).
@@ -367,6 +396,7 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         duplicateOf: duplicates[0]?.id,
         uploadedBy: user.id,
         mode: result.mode,
+        glCode: glDef.code,
         summary: result.summary,
         errorCount: errors.length,
         errors: errors.slice(0, MAX_STORED_ERRORS),
@@ -389,6 +419,7 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         fileCount: uploads.length,
         inputSha256,
         mode: result.mode,
+        glCode: glDef.code,
         dataRows: result.summary.dataRows,
         parsed: result.summary.parsed,
         netFils: result.summary.netFils,

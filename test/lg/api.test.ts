@@ -50,11 +50,21 @@ interface FakeRequestOptions {
     params?: Record<string, string>;
     body?: Buffer;
     form?: FormData;
+    /**
+     * GOAL-7: the picked GL, threaded as ?gl=. Defaults to the TCS breakdown code
+     * (the common upload) so existing breakdown tests need no change; register
+     * tests set gl: '99801000', and `gl: null` omits it (missing-gl guardrail test).
+     */
+    gl?: string | null;
 }
 
 function fakeRequest(options: FakeRequestOptions = {}): HttpRequest {
     const headers = options.headers ?? {};
-    const query = options.query ?? {};
+    const query: Record<string, string> = { ...(options.query ?? {}) };
+    const gl = options.gl === undefined ? 'D2810085' : options.gl;
+    if (gl !== null && query.gl === undefined) {
+        query.gl = gl;
+    }
     const body = options.body ?? Buffer.alloc(0);
     return {
         headers: { get: (name: string) => headers[name.toLowerCase()] ?? null },
@@ -233,6 +243,7 @@ describe('POST lg/runs (F1 upload + F9 persistence + F10 auth)', () => {
             fakeRequest({
                 headers: { 'x-user-id': 'u1', 'content-type': 'multipart/form-data; boundary=test' },
                 form,
+                gl: '99801000',
             })
         );
         expect(response.status).toBe(201);
@@ -406,6 +417,87 @@ describe('POST lg/runs (F1 upload + F9 persistence + F10 auth)', () => {
         expect(run.matching).toBeUndefined();
         expect(run.outstanding).toEqual([]);
         expect(run.outstandingCount).toBe(0);
+    });
+});
+
+describe('POST lg/runs — GL picker guardrails (GOAL-7)', () => {
+    it('rejects an upload without ?gl= with 400 and stores nothing', async () => {
+        const response = await createLgRun(
+            fakeRequest({ headers: { 'x-user-id': 'u1' }, gl: null, body: fixture('balanced-sample.csv') })
+        );
+        expect(response.status).toBe(400);
+        expect(mockRunCreate).not.toHaveBeenCalled();
+    });
+
+    it('rejects an unknown ?gl= with 422 UNKNOWN_GL', async () => {
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                gl: '55555555',
+                body: fixture('balanced-sample.csv'),
+            })
+        );
+        expect(response.status).toBe(422);
+        const body = response.jsonBody as { details: { errors: { code: string }[] } };
+        expect(body.details.errors[0].code).toBe('UNKNOWN_GL');
+        expect(mockRunCreate).not.toHaveBeenCalled();
+    });
+
+    it('rejects the TCS breakdown uploaded as MGR with 422 GL_MISMATCH', async () => {
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                gl: '99801000',
+                body: fixture('balanced-sample.csv'),
+            })
+        );
+        expect(response.status).toBe(422);
+        const body = response.jsonBody as { details: { errors: { code: string }[] } };
+        expect(body.details.errors[0].code).toBe('GL_MISMATCH');
+        expect(mockRunCreate).not.toHaveBeenCalled();
+    });
+
+    it('rejects the MGR register family uploaded as TCS with 422 GL_MISMATCH', async () => {
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'register-sample.xlsx' },
+                gl: 'D2810085',
+                body: fixture('register-sample.xlsx'),
+            })
+        );
+        expect(response.status).toBe(422);
+        const body = response.jsonBody as { details: { errors: { code: string }[] } };
+        expect(body.details.errors[0].code).toBe('GL_MISMATCH');
+    });
+
+    it('accepts a code VARIANT spelling and persists the canonical glCode', async () => {
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'register-sample.xlsx' },
+                gl: '0099801000',
+                body: fixture('register-sample.xlsx'),
+            })
+        );
+        expect(response.status).toBe(201);
+        expect((response.jsonBody as LgRun).glCode).toBe('99801000');
+    });
+
+    it('persists glCode on a TCS run and audits it', async () => {
+        const response = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1' },
+                query: { filename: 'balanced-sample.csv' },
+                gl: 'D2810085',
+                body: fixture('balanced-sample.csv'),
+            })
+        );
+        expect(response.status).toBe(201);
+        expect((response.jsonBody as LgRun).glCode).toBe('D2810085');
+        const auditCalls = mockAuditCreate.mock.calls;
+        const audit = auditCalls[auditCalls.length - 1][0] as { details: { glCode: string } };
+        expect(audit.details.glCode).toBe('D2810085');
     });
 });
 
@@ -701,6 +793,7 @@ describe('register-family pipeline (GOAL-3 R8)', () => {
             fakeRequest({
                 headers: { 'x-user-id': 'u1' },
                 query: { filename: 'register-sample.xlsx', asOf: '2026-02-03' },
+                gl: '99801000',
                 body: fixture('register-sample.xlsx'),
             })
         );

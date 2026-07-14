@@ -2,10 +2,12 @@
  * LG reconciliation — the authoritative Excel export (GOAL.md §4 F8, GOAL-2 G5).
  *
  * Builds the two-sheet workbook of GOAL.md §2.3 server-side from the stored run:
- *   Sheet 1 "MCQ+OLD ITEM" — the outstanding-items statement in the reference
- *           sample's layout (§2.2): header block with GL Balance / Total /
- *           Diffrence (sic) / Status, Section A (Old Items) and Section B
- *           (Outstanding MCQ, < 1 year) with subtotals.
+ *   Sheet 1 — the GL's outstanding-items statement in its catalog layout
+ *           (GL_CATALOG[glCodeOf(run)].statementLabels, GOAL-7 §6): the cheque
+ *           two-section layout for register-mode GLs, or the suspense-fragment
+ *           sections for breakdown-mode GLs. Both carry the header block with
+ *           GL Balance / Total / Diffrence (sic) / Status and Section A (Old) +
+ *           Section B (< 1 year) with subtotals.
  *   Sheet 2 "Mismatched"   — the full F6 exception list with reason codes.
  *
  * Figures come from the run's stored reconciliation block and detail items — the
@@ -23,6 +25,8 @@ import {
     BranchReconciliation,
     ChequeOutcome,
     ExplainedFigure,
+    GL_CATALOG,
+    glCodeOf,
     LgException,
     LgExceptionReason,
     LgRun,
@@ -68,7 +72,6 @@ export const EXC_TYPE_LABEL: Record<LgExceptionReason, string> = {
     EXTRACT_GAP: 'Ledger Extract Gap',
 };
 
-export const STATEMENT_SHEET = 'MCQ+OLD ITEM';
 export const MISMATCHED_SHEET = 'Mismatched';
 export const BALANCES_SHEET = 'Balances & Basis';
 
@@ -176,6 +179,7 @@ function buildRegisterStatement(
     recon: BranchReconciliation,
     outcomes: ChequeOutcome[],
     reviewDate: string,
+    labels: (typeof GL_CATALOG)[keyof typeof GL_CATALOG]['statementLabels'],
     branchFilter?: string
 ): void {
     const lines = outcomes
@@ -195,7 +199,7 @@ function buildRegisterStatement(
         o.opsRemark ? `${o.opsRemark}${o.opsJournal ? ` · jrnl ${o.opsJournal}` : ''}${o.opsDate ? ` · ${fmtIsoDate(o.opsDate)}` : ''}` : '';
 
     ws.columns = [6, 10, 16, 14, 14, 24, 18, 26, 14, 18, 28, 16].map((width) => ({ width }));
-    ws.getCell('A1').value = "GL Reconciliation — Outstanding Manager's Cheques (register-based)";
+    ws.getCell('A1').value = labels.statementTitle;
     ws.getCell('A1').font = { bold: true };
     ws.getCell('A2').value = `Branch: ${branchFilter ?? '(all branches)'}`;
     ws.getCell('A3').value = `Entity: ${recon.entity}  ·  GL: ${recon.gl}  ·  Review Date: ${fmtIsoDate(reviewDate)}`;
@@ -209,7 +213,7 @@ function buildRegisterStatement(
     const totalFils = oldFils + currentFils;
     const blockRows: [string, string][] = [
         ['GL Balance', fmtBhd(glMagFils)],
-        ['Total (OLD Item + MCQ)', fmtBhd(totalFils)],
+        [labels.totalLabel, fmtBhd(totalFils)],
         ['Diffrence', fmtBhd(glMagFils - totalFils)], // sic — matching the reference sample
         ['Classified exceptions (Sheet 2)', fmtBhd(Math.abs(recon.classifiedFils ?? 0))],
         ['Unexplained residual', fmtBhd(Math.abs(recon.residualFils ?? 0))],
@@ -223,7 +227,7 @@ function buildRegisterStatement(
     });
 
     let row = 11;
-    ws.getCell(`A${row}`).value = "Old Items Outstanding – Old Manager's Checks";
+    ws.getCell(`A${row}`).value = labels.oldTitle;
     ws.getCell(`A${row}`).font = { bold: true };
     row++;
     ws.getRow(row).values = [
@@ -261,7 +265,7 @@ function buildRegisterStatement(
     ws.getCell(`C${row}`).font = { bold: true };
     row += 2;
 
-    ws.getCell(`A${row}`).value = 'Outstanding MCQ  (Less than 1 year)';
+    ws.getCell(`A${row}`).value = labels.currentTitle;
     ws.getCell(`A${row}`).font = { bold: true };
     row++;
     ws.getRow(row).values = [
@@ -308,6 +312,7 @@ export async function buildStatementWorkbook(
     branchFilter?: string
 ): Promise<Buffer> {
     const reviewDate = run.reconciliation?.asOf ?? run.asOf ?? '';
+    const labels = GL_CATALOG[glCodeOf(run)].statementLabels;
     const isRegister = run.mode === 'register' && outcomes !== undefined;
     const branchExceptions = isRegister
         ? exceptions
@@ -320,18 +325,20 @@ export async function buildStatementWorkbook(
     const workbook = new ExcelJS.Workbook();
 
     if (isRegister) {
-        buildRegisterStatement(workbook.addWorksheet(STATEMENT_SHEET), recon, outcomes!, reviewDate, branchFilter);
+        buildRegisterStatement(workbook.addWorksheet(labels.sheetName), recon, outcomes!, reviewDate, labels, branchFilter);
         appendExceptionSheet(workbook, branchExceptions);
         appendBalancesBasisSheet(workbook, run);
         const bytes = await workbook.xlsx.writeBuffer();
         return Buffer.from(bytes as ArrayBuffer);
     }
 
-    // ── Sheet 1: the statement ────────────────────────────────────────────────
-    const ws = workbook.addWorksheet(STATEMENT_SHEET);
-    ws.columns = [6, 16, 14, 20, 18, 26, 14, 18, 36, 18, 28, 16].map((width) => ({ width }));
+    // ── Sheet 1: the breakdown (TCS) statement — suspense/FIFO fragment columns.
+    // Only breakdown runs reach this path, so the columns describe fragments, never
+    // cheques (GOAL-7 §6: TCS never in cheque columns).
+    const ws = workbook.addWorksheet(labels.sheetName);
+    ws.columns = [6, 16, 14, 20, 18, 12, 8, 14, 80].map((width) => ({ width }));
 
-    ws.getCell('A1').value = 'GL Reconciliation — Outstanding Items Statement';
+    ws.getCell('A1').value = labels.statementTitle;
     ws.getCell('A1').font = { bold: true };
     ws.getCell('A2').value = `Branch: ${recon.branchNumber}`;
     ws.getCell('A3').value = `Entity: ${recon.entity}  ·  GL: ${recon.gl}  ·  Review Date: ${fmtIsoDate(reviewDate)}`;
@@ -339,47 +346,45 @@ export async function buildStatementWorkbook(
     // Reconciliation block (right of the header, like the reference sample).
     ws.getCell('K2').value = 'GL Balance';
     ws.getCell('L2').value = fmtBhd(recon.glBalanceFils);
-    ws.getCell('K3').value = 'Total (OLD Item + MCQ)';
+    ws.getCell('K3').value = labels.totalLabel;
     ws.getCell('L3').value = fmtBhd(recon.oldFils + recon.currentFils);
     ws.getCell('K4').value = 'Diffrence'; // sic — matching the reference sample
     ws.getCell('L4').value = fmtBhd(recon.differenceFils);
     ws.getCell('K5').value = 'Status';
     ws.getCell('L5').value = recon.balanced ? 'Balanced' : 'Not Balanced';
 
-    let row = 7;
-    ws.getCell(`A${row}`).value = "Old Items Outstanding – Old Manager's Checks";
-    ws.getCell(`A${row}`).font = { bold: true };
-    row++;
-    const oldHeaders = [
+    const sectionHeaders = [
         'No.',
         'Amount (BHD)',
-        'Issuance Date',
-        'CHQ. #',
-        'Remitting Bank',
-        'Date of Transfer to Old Items',
+        'Post Date',
+        'Account Number',
+        'Journal Number',
+        'Log Code',
+        'DR/CR',
         'Review Date',
-        'Debit Account',
-        'Comment',
-        'Processed/Returned',
-        'Status',
+        'Reason / Comment',
     ];
-    ws.getRow(row).values = oldHeaders;
+    const fragmentRow = (item: LgException, i: number): (string | number)[] => [
+        i + 1,
+        fmtBhd(item.outstandingFils),
+        fmtIsoDate(item.postDate),
+        item.accountNumber ?? '',
+        item.journalNumber,
+        item.logCode ?? '',
+        item.direction === 'debit' ? 'DEBIT' : 'CREDIT',
+        fmtIsoDate(reviewDate),
+        item.message,
+    ];
+
+    let row = 7;
+    ws.getCell(`A${row}`).value = labels.oldTitle;
+    ws.getCell(`A${row}`).font = { bold: true };
+    row++;
+    ws.getRow(row).values = sectionHeaders;
     ws.getRow(row).font = { bold: true };
     row++;
     oldItems.forEach((item, i) => {
-        ws.getRow(row).values = [
-            i + 1,
-            fmtBhd(item.outstandingFils),
-            fmtIsoDate(item.postDate),
-            `ROW ${item.rowNumber}${item.sheet ? ` · ${item.sheet}` : ''}`,
-            '',
-            '',
-            fmtIsoDate(reviewDate),
-            item.accountNumber ?? '',
-            item.message,
-            '',
-            '',
-        ];
+        ws.getRow(row).values = fragmentRow(item, i);
         row++;
     });
     ws.getCell(`A${row}`).value = 'Subtotal';
@@ -388,24 +393,14 @@ export async function buildStatementWorkbook(
     ws.getCell(`B${row}`).font = { bold: true };
     row += 2;
 
-    ws.getCell(`A${row}`).value = 'Outstanding MCQ  (Less than 1 year)';
+    ws.getCell(`A${row}`).value = labels.currentTitle;
     ws.getCell(`A${row}`).font = { bold: true };
     row++;
-    const currentHeaders = ['No.', 'Amount (BHD)', 'Issuance Date', 'CHQ. #', 'Remitting Bank', 'Review Date', 'Comment', 'Status'];
-    ws.getRow(row).values = currentHeaders;
+    ws.getRow(row).values = sectionHeaders;
     ws.getRow(row).font = { bold: true };
     row++;
     currentItems.forEach((item, i) => {
-        ws.getRow(row).values = [
-            i + 1,
-            fmtBhd(item.outstandingFils),
-            fmtIsoDate(item.postDate),
-            `ROW ${item.rowNumber}${item.sheet ? ` · ${item.sheet}` : ''}`,
-            '',
-            fmtIsoDate(reviewDate),
-            item.message,
-            '',
-        ];
+        ws.getRow(row).values = fragmentRow(item, i);
         row++;
     });
     ws.getCell(`A${row}`).value = 'Subtotal';
