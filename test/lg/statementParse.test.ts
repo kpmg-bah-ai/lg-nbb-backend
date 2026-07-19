@@ -269,3 +269,27 @@ describe('wrong-value tracking', () => {
         expect(errors).toHaveLength(0);
     });
 });
+
+describe('GOAL-8: zero-amount rows (VAT statement GLs)', () => {
+    const VAT_HEADER: RawRow = [
+        'Transaction Date', 'Posting Date', 'Nostro/BGL Account', 'Journal Number', 'Account Name',
+        'Transaction Description', 'Cheque Number', 'Transaction Credit Amount', 'Transaction Debit Amount',
+        'Transaction Type', 'Teller', 'Branch', 'End Date EoD Balance',
+    ];
+    const vatRow = (credit: unknown, debit: unknown): RawRow => [
+        new Date('2023-01-09T00:00:00Z'), new Date('2023-01-09T00:00:00Z'), '8828010400010000', 'J1',
+        'INPUT VAT RECEIVABLE MUBASHER - BHD', 'NPB MISC DEP DR', '', credit as never, debit as never,
+        '01-Financial', 'System', '00001-Main Branch', 0.499,
+    ];
+
+    it('classifies a literal-zero amount row as ZERO_AMOUNT, not BAD_AMOUNT', () => {
+        const { postings, errors } = parseStatementSheet([VAT_HEADER, vatRow(0, null)], 'VAT');
+        expect(postings).toHaveLength(0); // zero rows don't move the running balance
+        expect(errors).toEqual([expect.objectContaining({ code: 'ZERO_AMOUNT', row: 1 })]);
+    });
+
+    it('still reports non-numeric junk in an amount column as BAD_AMOUNT', () => {
+        const { errors } = parseStatementSheet([VAT_HEADER, vatRow('abc', null)], 'VAT');
+        expect(errors).toEqual([expect.objectContaining({ code: 'BAD_AMOUNT', row: 1 })]);
+    });
+});

@@ -1,10 +1,10 @@
-import { validateGlUpload } from '../../src/lg/glGuard';
+import { detectGlFromUpload, validateGlUpload } from '../../src/lg/glGuard';
 import { IngestResult } from '../../src/lg/ingest';
 import { GL_CATALOG } from '../../src/shared/models';
 import { makePosting } from './helpers';
 
 /** Minimal IngestResult around a set of postings. */
-function ingestResult(mode: 'breakdown' | 'register', gls: string[]): IngestResult {
+function ingestResult(mode: 'breakdown' | 'register' | 'statement', gls: string[]): IngestResult {
     const postings = gls.map((gl, i) => makePosting({ amountBhdFils: 1000 * (i + 1), gl }));
     return {
         mode,
@@ -67,5 +67,28 @@ describe('validateGlUpload (GOAL-7 §3 guardrail)', () => {
         const errors = validateGlUpload(GL_CATALOG.D2810085, ingestResult('register', ['0000000099801000']));
         expect(errors).toHaveLength(1);
         expect(errors[0].code).toBe('GL_MISMATCH');
+    });
+});
+
+describe('detectGlFromUpload (GOAL-8 content auto-detect)', () => {
+    it('detects the VAT GL from an ingested statement upload', () => {
+        const result = ingestResult('statement', ['8828010400010000', '8828010400010000']);
+        expect(detectGlFromUpload(result)).toEqual({ glCode: '8828010400010000' });
+    });
+
+    it('reports an unknown embedded account', () => {
+        const result = ingestResult('statement', ['8828019999990000']);
+        expect(detectGlFromUpload(result)).toEqual({ unknown: ['8828019999990000'] });
+    });
+
+    it('reports ambiguity when rows carry more than one catalog GL', () => {
+        const result = ingestResult('statement', ['8828010400010000', '8828010500010000']);
+        expect(detectGlFromUpload(result)).toEqual({
+            ambiguous: expect.arrayContaining(['8828010400010000', '8828010500010000']),
+        });
+    });
+
+    it('returns an empty detection when nothing is embedded', () => {
+        expect(detectGlFromUpload(ingestResult('statement', []))).toEqual({});
     });
 });

@@ -162,11 +162,51 @@ export function explainRun(input: ExplainInput): ExplainedFigure[] {
 
     if (input.mode === 'register' && input.reconciliation?.byBranch[0]) {
         explainRegister(figures, input.reconciliation.byBranch[0], input);
+    } else if (input.mode === 'statement' && input.reconciliation?.byBranch[0]) {
+        explainStatement(figures, input.reconciliation.byBranch[0]);
     } else {
         explainBreakdown(figures, input);
     }
 
     return figures;
+}
+
+/** GOAL-8: a running-balance statement run — no matching, no outstanding; the story
+ *  is derived vs stated and the tie-out gap between them. */
+function explainStatement(figures: ExplainedFigure[], block: NonNullable<Reconciliation['byBranch'][number]>): void {
+    figures.push(
+        moneyFigure(block.derivedBalanceFils ?? 0, {
+            key: 'derivedBalance',
+            label: 'Derived balance (from postings)',
+            group: 'balance',
+            basis: 'Σ signed postings across the statement (debit +, credit −), independent of the stated figure.',
+            inputs: ['netMovement'],
+            assessment: 'What the ledger movements themselves reconstruct — the number that must equal the stated closing balance.',
+        }),
+        moneyFigure(block.glBalanceFils, {
+            key: 'glBalance',
+            label: 'Stated End-Date EoD balance',
+            group: 'balance',
+            basis: "The End Date EoD Balance on the statement's final-day rows, negated into engine sign — the ledger's own closing figure.",
+            assessment: 'The control total for a running-balance GL: the derived balance must reproduce it exactly.',
+        })
+    );
+    if (block.extractGapFils !== undefined) {
+        const gap = block.extractGapFils;
+        figures.push(
+            moneyFigure(gap, {
+                key: 'extractGap',
+                label: 'Tie-out gap (derived − stated)',
+                group: 'reconciliation',
+                basis: 'Derived balance − stated End-Date EoD balance.',
+                inputs: ['derivedBalance', 'glBalance'],
+                flag: gap !== 0,
+                assessment: gap === 0
+                    ? 'The postings reproduce the stated balance to the fil — the running-balance ledger ties out.'
+                    : `${money(Math.abs(gap))} of movement is unaccounted for between the postings and the stated closing balance — investigate before relying on the VAT figure.`,
+            })
+        );
+    }
 }
 
 function explainRegister(

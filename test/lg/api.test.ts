@@ -253,6 +253,62 @@ describe('POST lg/runs (F1 upload + F9 persistence + F10 auth)', () => {
         expect(run.files).toHaveLength(2);
     });
 
+    // GOAL-8: a small VAT statement workbook that ties out — derived net
+    // (−500 + 300 + 700 = +500 fils engine-signed) equals −(stated −0.5) on the
+    // single final-post-date row.
+    const vatWorkbook = async () => {
+        const ExcelJS = await import('exceljs');
+        const workbook = new ExcelJS.Workbook();
+        workbook.addWorksheet('Nostro and BGL Account Statemen').addRows([
+            ['Nostro & BGL Account Statement'],
+            [],
+            ['Transaction Date', 'Posting Date', 'Nostro/BGL Account', 'Journal Number', 'Account Name',
+                'Transaction Description', 'Cheque Number', 'Transaction Credit Amount', 'Transaction Debit Amount',
+                'Transaction Type', 'Teller', 'Branch', 'End Date EoD Balance', 'Previous EoD Balance'],
+            [new Date('2023-01-09T00:00:00Z'), new Date('2023-01-09T00:00:00Z'), '8828010400010000', 'J1',
+                'INPUT VAT RECEIVABLE MUBASHER - BHD', 'NPB MISC DEP DR', '', 0.5, null, '01-Financial', 'System', '00001-Main Branch', -0.2, 0],
+            [new Date('2023-01-09T00:00:00Z'), new Date('2023-01-09T00:00:00Z'), '8828010400010000', 'J2',
+                'INPUT VAT RECEIVABLE MUBASHER - BHD', 'VAT ON FEES', '', null, -0.3, '01-Financial', 'System', '00001-Main Branch', -0.2, 0],
+            [new Date('2023-01-10T00:00:00Z'), new Date('2023-01-10T00:00:00Z'), '8828010400010000', 'J3',
+                'INPUT VAT RECEIVABLE MUBASHER - BHD', 'VAT ON CHARGES', '', null, -0.7, '01-Financial', 'System', '00002-Branch', -0.5, -0.2],
+        ]);
+        return Buffer.from(await workbook.xlsx.writeBuffer());
+    };
+
+    it('ingests a VAT statement upload as a balanced statement run', async () => {
+        const form = new FormData();
+        form.append('file', new File([new Uint8Array(await vatWorkbook())], 'vat.xlsx'));
+        const res = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1', 'content-type': 'multipart/form-data; boundary=test' },
+                form,
+                gl: '8828010400010000',
+            })
+        );
+        expect(res.status).toBe(201);
+        const run = res.jsonBody as LgRun;
+        expect(run.mode).toBe('statement');
+        expect(run.glCode).toBe('8828010400010000');
+        expect(run.matching).toBeUndefined();
+        expect(run.reconciliation!.balanced).toBe(true);
+        expect(run.reconciliation!.byBranch[0].extractGapFils).toBe(0);
+        expect(run.ledgerRowCount).toBeGreaterThan(0);
+    });
+
+    it('rejects a VAT file uploaded under the wrong VAT GL with GL_MISMATCH', async () => {
+        const form = new FormData();
+        form.append('file', new File([new Uint8Array(await vatWorkbook())], 'vat.xlsx')); // account 8828010400010000
+        const res = await createLgRun(
+            fakeRequest({
+                headers: { 'x-user-id': 'u1', 'content-type': 'multipart/form-data; boundary=test' },
+                form,
+                gl: '8828010500010000',
+            })
+        );
+        expect(res.status).toBe(422);
+        expect((res.jsonBody as { details: { errors: { code: string }[] } }).details.errors[0].code).toBe('GL_MISMATCH');
+    });
+
     it('rejects a file with missing required headers with 422 and stores nothing', async () => {
         const response = await createLgRun(
             fakeRequest({

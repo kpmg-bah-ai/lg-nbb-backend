@@ -212,16 +212,21 @@ export function parseStatementSheet(rows: RawRow[], sheetName?: string, rowOffse
             direction = 'debit';
             amountBhdFils = Math.abs(debitFils); // debits are held negative in the file
         } else {
-            // Point the error at whichever cell actually holds content (wrong
-            // text or a zero); when both are empty the amounts are missing,
-            // not wrong, and there is no cell to track.
+            // A cell holding a literal 0 is a genuine zero-value posting (it does not
+            // move the running balance) — ZERO_AMOUNT, benign, mirrors breakdown mode.
+            // Only non-numeric / missing content is BAD_AMOUNT. Point the error at
+            // whichever cell actually holds content; when both are empty the amounts
+            // are missing, not wrong, and there is no cell to track.
+            const zero = creditFils === 0 || debitFils === 0;
             const offending = rawCellText(creditRaw) !== undefined ? ('creditAmount' as const) : rawCellText(debitRaw) !== undefined ? ('debitAmount' as const) : undefined;
             rowErrors.push({
-                code: 'BAD_AMOUNT',
+                code: zero ? 'ZERO_AMOUNT' : 'BAD_AMOUNT',
                 field: 'amountBhd',
                 row: rowNumber,
                 sheet: sheetName,
-                message: 'Neither amount column carries a non-zero value',
+                message: zero
+                    ? 'Both amount columns are zero — zero-value posting, excluded (does not affect the running balance)'
+                    : 'Neither amount column carries a non-zero value',
                 ...(offending ? cellTrack(header, columns[offending], cell(row, offending)) : {}),
             });
         }

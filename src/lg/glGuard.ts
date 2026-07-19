@@ -15,7 +15,7 @@
  * reject before this guard runs, so requiredSheetRoles needs no re-check here.
  */
 
-import { GL_CATALOG, GlDefinition, ParseError, resolveGlCode } from '../shared/models';
+import { GL_CATALOG, GlCode, GlDefinition, ParseError, resolveGlCode } from '../shared/models';
 import { IngestResult } from './ingest';
 
 export function validateGlUpload(gl: GlDefinition, result: IngestResult): ParseError[] {
@@ -56,4 +56,40 @@ export function validateGlUpload(gl: GlDefinition, result: IngestResult): ParseE
         }
     }
     return errors;
+}
+
+export interface GlDetection {
+    glCode?: GlCode;
+    /** More than one catalog GL appeared in the rows (should not happen for VAT). */
+    ambiguous?: GlCode[];
+    /** Non-empty embedded GL values that resolve to nothing. */
+    unknown?: string[];
+}
+
+/** Resolves the GL a parsed upload belongs to from its embedded content (GOAL-8 auto-detect). */
+export function detectGlFromUpload(result: IngestResult): GlDetection {
+    const found = new Set<GlCode>();
+    const unknown = new Set<string>();
+    for (const p of result.postings) {
+        const raw = p.gl.trim();
+        if (!raw) {
+            continue;
+        }
+        const code = resolveGlCode(raw);
+        if (code) {
+            found.add(code);
+        } else {
+            unknown.add(raw);
+        }
+    }
+    if (found.size === 1) {
+        return { glCode: [...found][0] };
+    }
+    if (found.size > 1) {
+        return { ambiguous: [...found] };
+    }
+    if (unknown.size > 0) {
+        return { unknown: [...unknown] };
+    }
+    return {};
 }

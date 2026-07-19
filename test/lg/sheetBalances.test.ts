@@ -80,4 +80,18 @@ describe('computeSheetBalances (GOAL-5 per-sheet balance reference)', () => {
         const balances = computeSheetBalances(ingestResult({ postings, cheques, errors }));
         expect(balances.map((b) => b.sheet)).toEqual(['Debit', 'Sheet1', 'Notes']);
     });
+
+    it('statement mode uses the ledger role and captures the stated EoD', () => {
+        const balances = computeSheetBalances({
+            mode: 'statement',
+            postings: [
+                makePosting({ amountBhdFils: 500, sheet: 'VAT', statedEodFils: -1000, postDate: '2023-02-01' }),
+                makePosting({ amountBhdFils: 500, sheet: 'VAT', statedEodFils: -1000, postDate: '2023-02-01' }),
+            ],
+            errors: [],
+        });
+        expect(balances[0].role).toBe('ledger');
+        expect(balances[0].netFils).toBe(1000);       // Σ debit − credit
+        expect(balances[0].statedEodFils).toBe(1000); // −(−1000) engine-signed
+    });
 });

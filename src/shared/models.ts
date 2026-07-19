@@ -85,7 +85,7 @@ export type RawRow = RawCell[];
  * both families stay in scope). Runs stored before GOAL-3 have no `mode` and are
  * breakdown runs by definition.
  */
-export type LgRunMode = 'breakdown' | 'register';
+export type LgRunMode = 'breakdown' | 'register' | 'statement';
 
 /** Role a worksheet plays within an uploaded workbook (GOAL-3 §4.1). */
 export type SheetRole = 'breakdown' | 'ledgerStatement' | 'register' | 'unknown';
@@ -487,7 +487,7 @@ export type LgExceptionReason =
 // ---------- GOAL-7: GL catalog ----------
 
 /** Canonical GL codes the app knows — the discriminant persisted on LgRun.glCode. */
-export type GlCode = '99801000' | 'D2810085';
+export type GlCode = '99801000' | 'D2810085' | '8828010400010000' | '8828010500010000';
 
 /** How the dashboard scopes a GL's statement (GOAL-7 "Two scoping concepts"). */
 export type GlBranchNav = 'branchSections' | 'consolidated';
@@ -515,12 +515,12 @@ export interface GlDefinition {
     branchNav: GlBranchNav;
     /** DR/CR derivation: split Credit/Debit amount columns vs the sign of one amount column. */
     directionModel: 'columnSplit' | 'amountSign';
-    /** Two-legged GL↔register key matching vs per-account FIFO offsetting. */
-    matchModel: 'registerTwoLegged' | 'fifoByAccount';
+    /** Two-legged GL↔register key matching, per-account FIFO, or no matching (statement). */
+    matchModel: 'registerTwoLegged' | 'fifoByAccount' | 'none';
     /** Stated-EoD with gap/residual decomposition vs derived == stated tie-out. */
     balanceModel: 'statedEodDecomposition' | 'derivedEqualsStated';
     /** Statement layout key — resolved by the frontend GL_UI registry and the export labels. */
-    statement: 'chequeTwoSection' | 'suspenseFragments';
+    statement: 'chequeTwoSection' | 'suspenseFragments' | 'runningBalance';
     /** Exception reasons this GL's pipeline can emit (drives UI badge subsets + tests). */
     exceptionReasons: LgExceptionReason[];
     /** Data sentinels the parsers honour. Empty object = none: absence expresses "missing". */
@@ -632,6 +632,60 @@ export const GL_CATALOG: Record<GlCode, GlDefinition> = {
             totalLabel: 'Total (Old + Current Fragments)',
         },
     },
+    '8828010400010000': {
+        code: '8828010400010000',
+        codeVariants: ['8828010400010000'],
+        name: 'INPUT VAT RECEIVABLE MUBASHER — BHD',
+        shortName: 'VAT Input 8828…0400',
+        mode: 'statement',
+        requiredSheetRoles: ['ledgerStatement'],
+        fingerprint: ['Nostro/BGL Account', 'Transaction Credit Amount', 'Transaction Debit Amount', 'End Date EoD Balance'],
+        entity: 'BH',
+        currency: 'BHD',
+        branchNav: 'consolidated',
+        directionModel: 'columnSplit',
+        matchModel: 'none',
+        balanceModel: 'derivedEqualsStated',
+        statement: 'runningBalance',
+        // Statement mode surfaces only the run-level tie-out gap (EXTRACT_GAP) if it fails.
+        exceptionReasons: ['EXTRACT_GAP'],
+        sentinels: {},
+        // GOAL-8 §2(B): Account Name is redacted client-side; kept here as the PII surface.
+        piiColumns: ['Account Name', 'Teller', 'Detailed Description'],
+        statementLabels: {
+            sheetName: 'VAT INPUT LEDGER',
+            statementTitle: 'GL Reconciliation — Input VAT Receivable (running balance)',
+            oldTitle: '',
+            currentTitle: '',
+            totalLabel: 'Stated End-Date EoD Balance',
+        },
+    },
+    '8828010500010000': {
+        code: '8828010500010000',
+        codeVariants: ['8828010500010000'],
+        name: 'OUTPUT VAT PAYABLE MUBASHER — BHD',
+        shortName: 'VAT Output 8828…0500',
+        mode: 'statement',
+        requiredSheetRoles: ['ledgerStatement'],
+        fingerprint: ['Nostro/BGL Account', 'Transaction Credit Amount', 'Transaction Debit Amount', 'End Date EoD Balance'],
+        entity: 'BH',
+        currency: 'BHD',
+        branchNav: 'consolidated',
+        directionModel: 'columnSplit',
+        matchModel: 'none',
+        balanceModel: 'derivedEqualsStated',
+        statement: 'runningBalance',
+        exceptionReasons: ['EXTRACT_GAP'],
+        sentinels: {},
+        piiColumns: ['Account Name', 'Teller', 'Detailed Description'],
+        statementLabels: {
+            sheetName: 'VAT OUTPUT LEDGER',
+            statementTitle: 'GL Reconciliation — Output VAT Payable (running balance)',
+            oldTitle: '',
+            currentTitle: '',
+            totalLabel: 'Stated End-Date EoD Balance',
+        },
+    },
 };
 
 /** Normalises a GL spelling: trim, uppercase, strip leading zeros from all-digit text. */
@@ -693,6 +747,21 @@ export interface ExceptionSummary {
     byReason: Partial<Record<LgExceptionReason, number>>;
 }
 
+/** GOAL-8: a persisted, capped projection of one statement posting (the ledger view). */
+export interface LedgerRow {
+    rowNumber: number;
+    postDate: string;
+    transactionDate?: string;
+    description: string;
+    branchNumber: string;
+    journalNumber: string;
+    direction: PostingDirection;
+    /** Signed engine fils (debit +, credit −). */
+    amountBhdFils: number;
+    /** Stated End-Date EoD balance on this row, engine-signed fils. */
+    statedEodFils?: number;
+}
+
 /**
  * A chunk of per-run detail rows stored in the `lgRunDetails` container (GOAL-2
  * G3/§8.3): matched sets and exceptions are too numerous for the run document
@@ -700,9 +769,9 @@ export interface ExceptionSummary {
  */
 export interface LgRunDetailChunk extends BaseDocument {
     runId: string;
-    kind: 'matchedSets' | 'exceptions' | 'cheques';
+    kind: 'matchedSets' | 'exceptions' | 'cheques' | 'ledger';
     seq: number;
-    items: MatchedSet[] | LgException[] | ChequeOutcome[];
+    items: MatchedSet[] | LgException[] | ChequeOutcome[] | LedgerRow[];
 }
 
 // ---------- F5: reconciliation & Difference ----------
@@ -886,6 +955,8 @@ export interface LgRun extends BaseDocument {
     chequesByState?: Partial<Record<ChequeState, number>>;
     /** Cheques with no issuance credit in the ledger window (legacy population). */
     preWindowChequeCount?: number;
+    /** GOAL-8: total statement ledger rows (rows live in lgRunDetails kind 'ledger', capped). */
+    ledgerRowCount?: number;
 
     // ---- GOAL-5: per-sheet balance reference + number provenance ----
     /** Balance of all amounts per worksheet — the saved reference (GOAL-5). */

@@ -33,6 +33,7 @@ import { reconcile } from '../lg/reconcile';
 import { classifyRegisterExceptions } from '../lg/registerExceptions';
 import { matchRegister } from '../lg/registerMatch';
 import { extractStatedBalance, reconcileRegister } from '../lg/registerReconcile';
+import { reconcileStatement } from '../lg/statementReconcile';
 import { computeSheetBalances } from '../lg/sheetBalances';
 import { explainRun } from '../lg/provenance';
 import {
@@ -40,6 +41,7 @@ import {
     ChequeState,
     ExceptionSummary,
     GL_CATALOG,
+    LedgerRow,
     LgException,
     LgRun,
     LgRunDetailChunk,
@@ -128,11 +130,11 @@ export function buildDetailChunks<T>(
 async function storeDetailChunks(
     runId: string,
     kind: LgRunDetailChunk['kind'],
-    items: MatchedSet[] | LgException[] | ChequeOutcome[]
+    items: MatchedSet[] | LgException[] | ChequeOutcome[] | LedgerRow[]
 ): Promise<number> {
     const capped = items.slice(0, maxStoredDetailItems());
     const stored = kind === 'matchedSets' ? (capped as MatchedSet[]).map(trimMatchedSet) : capped;
-    const chunks = buildDetailChunks<MatchedSet | LgException | ChequeOutcome>(stored);
+    const chunks = buildDetailChunks<MatchedSet | LgException | ChequeOutcome | LedgerRow>(stored);
     for (let seq = 0; seq < chunks.length; seq++) {
         await lgRunDetails.create({ runId, kind, seq, items: chunks[seq] as LgRunDetailChunk['items'] });
     }
@@ -140,7 +142,7 @@ async function storeDetailChunks(
 }
 
 /** Reads every stored detail item of one kind for a run, in chunk order. */
-async function readDetailItems<T extends MatchedSet | LgException | ChequeOutcome>(
+async function readDetailItems<T extends MatchedSet | LgException | ChequeOutcome | LedgerRow>(
     runId: string,
     kind: LgRunDetailChunk['kind']
 ): Promise<T[]> {
@@ -299,6 +301,7 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
     let exceptions: { exceptions: LgException[]; summary: ExceptionSummary } | undefined;
     let outcomes: ChequeOutcome[] | undefined;
     let registerFields: Pick<LgRun, 'chequeCount' | 'chequesByState' | 'preWindowChequeCount'> | undefined;
+    let ledgerRows: LedgerRow[] | undefined;
 
     if (result.postings.length > 0) {
         if (result.mode === 'register') {
@@ -322,6 +325,27 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
                 chequesByState,
                 preWindowChequeCount: chequesByState.PRE_WINDOW ?? 0,
             };
+        } else if (result.mode === 'statement') {
+            // GOAL-8: no matching, no outstanding, no exceptions. Reconcile the derived
+            // net against the stated EoD; the tie-out gap (when non-zero) surfaces via
+            // the `extractGap` explained figure (flagged) and reconciliation.balanced —
+            // no synthetic exception is needed (and the real VAT files tie out exactly).
+            const stated = extractStatedBalance(result.postings);
+            if (stated.error) {
+                errors.push(stated.error);
+            }
+            reconciliation = reconcileStatement(stated.statedFils, balances, { asOf });
+            ledgerRows = result.postings.map((p) => ({
+                rowNumber: p.rowNumber,
+                postDate: p.postDate,
+                transactionDate: p.transactionDate,
+                description: p.logDescription,
+                branchNumber: p.branchNumber,
+                journalNumber: p.journalNumber,
+                direction: p.direction,
+                amountBhdFils: p.amountBhdFils,
+                statedEodFils: p.statedEodFils,
+            }));
         } else {
             match = matchPostings(result.postings, { asOf });
             // F5: Difference & Balanced per branch, from the full (uncapped) outstanding list.
@@ -385,6 +409,9 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
     if (outcomes && outcomes.length > 0) {
         await storeDetailChunks(runId, 'cheques', outcomes);
     }
+    if (ledgerRows && ledgerRows.length > 0) {
+        await storeDetailChunks(runId, 'ledger', ledgerRows);
+    }
     const run = await lgRuns.create({
         id: runId,
         filename,
@@ -413,6 +440,7 @@ export async function createLgRun(request: HttpRequest): Promise<HttpResponseIni
         sheetBalances,
         explanations,
         ...registerFields,
+        ledgerRowCount: ledgerRows ? ledgerRows.length : undefined,
     });
     await recordAudit(user.id, 'lg.breakdown.ingested', 'lgRun', run.id, {
         filename,
@@ -487,6 +515,8 @@ export const listLgRunMatched = detailListHandler('matchedSets', (run) => run.ma
 export const listLgRunExceptions = detailListHandler('exceptions', (run) => run.exceptionCount ?? 0);
 /** GOAL-3 R8: per-cheque outcomes of a register-mode run, offset-paged. */
 export const listLgRunCheques = detailListHandler('cheques', (run) => run.chequeCount ?? 0);
+/** GOAL-8: the persisted statement ledger rows of a statement-mode run, offset-paged. */
+export const listLgRunLedger = detailListHandler('ledger', (run) => run.ledgerRowCount ?? 0);
 
 /**
  * G5: the authoritative export — a two-sheet workbook (statement + Mismatched) built
@@ -506,6 +536,10 @@ export async function exportLgRun(request: HttpRequest): Promise<HttpResponseIni
     const blocks = run.reconciliation?.byBranch ?? [];
     if (blocks.length === 0) {
         return badRequest('This run has no reconciliation to export');
+    }
+    // GOAL-8 §2(G): a statement run has no outstanding-items population to export.
+    if (run.mode === 'statement') {
+        return badRequest('This GL is a running-balance statement with no outstanding-items export — see the Ledger and Basis tabs.');
     }
     const entity = request.query.get('entity');
     const gl = request.query.get('gl');
@@ -588,6 +622,12 @@ app.http('lg-runs-cheques', {
     methods: ['GET'],
     authLevel: 'anonymous',
     handler: listLgRunCheques,
+});
+app.http('lg-runs-ledger', {
+    route: 'lg/runs/{id}/ledger',
+    methods: ['GET'],
+    authLevel: 'anonymous',
+    handler: listLgRunLedger,
 });
 app.http('lg-runs-export', {
     route: 'lg/runs/{id}/export',

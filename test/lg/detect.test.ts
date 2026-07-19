@@ -157,3 +157,53 @@ describe('ingest routing (GOAL-3 R1)', () => {
         expect(result.postings).toHaveLength(1);
     });
 });
+
+const VAT_HEADER = [
+    'Transaction Date', 'Posting Date', 'Nostro/BGL Account', 'Journal Number', 'Account Name',
+    'Transaction Description', 'Cheque Number', 'Transaction Credit Amount', 'Transaction Debit Amount',
+    'Transaction Type', 'Teller', 'Branch', 'End Date EoD Balance', 'Previous EoD Balance',
+];
+const vatRow = (credit: unknown, debit: unknown, eod: number) => [
+    new Date('2023-01-09T00:00:00Z'), new Date('2023-01-09T00:00:00Z'), '8828010400010000', 100483992,
+    'INPUT VAT RECEIVABLE MUBASHER - BHD', 'NPB MISC DEP DR', '', credit, debit,
+    '01-Financial', 'System', '00001-Main Branch', eod, 0,
+];
+
+describe('GOAL-8 statement mode routing', () => {
+    it('a lone statement whose account is a statement GL ingests as mode statement', async () => {
+        const buffer = await workbookBuffer([
+            { name: 'Nostro and BGL Account Statemen', rows: [
+                ['Nostro & BGL Account Statement'], [], VAT_HEADER,
+                vatRow(0.5, null, 0.499), vatRow(null, -0.5, 0), // debit −0.5 → +0.5 engine
+            ] },
+        ]);
+        const result = await ingest(buffer, { filename: 'vat.xlsx' });
+        expect(result.mode).toBe('statement');
+        expect(result.cheques).toBeUndefined();
+        expect(result.postings).toHaveLength(2);
+        expect(result.summary.netFils).toBe(0); // +500 (debit) − 500 (credit)
+        expect(result.errors.filter(e => e.code === 'INCOMPLETE_REGISTER_INPUT')).toHaveLength(0);
+    });
+
+    it('a lone statement whose account is a REGISTER GL stays INCOMPLETE_REGISTER_INPUT', async () => {
+        const buffer = await workbookBuffer([
+            { name: 'Credit', rows: [VAT_HEADER, [
+                new Date('2025-03-10T00:00:00Z'), new Date('2025-03-10T00:00:00Z'), '99801000', 5001,
+                'MC PAYABLE', 'X', '', 100, null, '01', 'T', '001', 2730, 0,
+            ]] },
+        ]);
+        const result = await ingest(buffer, { filename: 'mgr-half.xlsx' });
+        expect(result.postings).toHaveLength(0);
+        expect(result.errors).toEqual([expect.objectContaining({ code: 'INCOMPLETE_REGISTER_INPUT' })]);
+    });
+
+    it('a statement-schema CSV routes to statement mode (not breakdown)', async () => {
+        const csv = [
+            VAT_HEADER.join(','),
+            ['2023-01-09', '2023-01-09', '8828010400010000', 'J1', 'INPUT VAT', 'NPB', '', '0.5', '', '01', 'T', '00001-Main Branch', '0.499', '0'].join(','),
+        ].join('\n');
+        const result = await ingest(Buffer.from(csv), { filename: 'vat.sanitized.csv' });
+        expect(result.mode).toBe('statement');
+        expect(result.postings).toHaveLength(1);
+    });
+});

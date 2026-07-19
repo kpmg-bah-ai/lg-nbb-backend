@@ -13,7 +13,7 @@
 
 import { Readable } from 'node:stream';
 import * as ExcelJS from 'exceljs';
-import { LgRunMode, ParseError, ParsedPosting, ParseResult, RawCell, RawRow, RegisterCheque } from '../shared/models';
+import { GL_CATALOG, LgRunMode, ParseError, ParsedPosting, ParseResult, RawCell, RawRow, RegisterCheque, resolveGlCode } from '../shared/models';
 import { detectSheetRole, resolveMode } from './detect';
 import { parseSheets, SheetRows } from './parse';
 import { parseRegisterSheet } from './registerParse';
@@ -290,6 +290,69 @@ function parseRegisterFamily(sheets: SheetRows[], roles: ReturnType<typeof detec
     };
 }
 
+/** Parses a statement-only workbook (GOAL-8): every ledgerStatement sheet feeds
+ *  postings via parseStatementSheet (continuous row numbers); no register, no cheques. */
+function parseStatementFamily(sheets: SheetRows[], roles: ReturnType<typeof detectSheetRole>[]): IngestResult {
+    const postings: ParsedPosting[] = [];
+    const errors: ParseError[] = [];
+    let ledgerRows = 0;
+    for (let i = 0; i < sheets.length; i++) {
+        if (roles[i] === 'ledgerStatement') {
+            const result = parseStatementSheet(sheets[i].rows, sheets[i].name, ledgerRows);
+            postings.push(...result.postings);
+            errors.push(...result.errors);
+            ledgerRows += result.dataRows;
+        } else {
+            errors.push({
+                code: 'SHEET_SKIPPED',
+                sheet: sheets[i].name,
+                message: `Worksheet ${sheets[i].name ? `"${sheets[i].name}"` : '(unnamed)'} is not a ledger-statement sheet — skipped`,
+            });
+        }
+    }
+    let debitCount = 0;
+    let creditCount = 0;
+    let netFils = 0;
+    const currencies = new Set<string>();
+    const branches = new Set<string>();
+    for (const p of postings) {
+        netFils += p.amountBhdFils;
+        if (p.direction === 'debit') {
+            debitCount++;
+        } else {
+            creditCount++;
+        }
+        currencies.add(p.currency);
+        branches.add(p.branchNumber);
+    }
+    return {
+        mode: 'statement',
+        postings,
+        errors,
+        summary: {
+            dataRows: ledgerRows,
+            parsed: postings.length,
+            debitCount,
+            creditCount,
+            netFils,
+            currencies: [...currencies].sort(),
+            branches: [...branches].sort(),
+        },
+    };
+}
+
+/** The embedded GL of a statement-only workbook = the resolved Nostro/BGL Account
+ *  of its first parsed posting. undefined when nothing resolves. */
+function statementGlOf(postings: ParsedPosting[]): ReturnType<typeof resolveGlCode> {
+    for (const p of postings) {
+        const code = resolveGlCode(p.gl);
+        if (code) {
+            return code;
+        }
+    }
+    return undefined;
+}
+
 /**
  * Classifies pooled worksheets by role (GOAL-3 §4.1) and parses them:
  * breakdown sheets keep the original pipeline; register-family sheets (ledger
@@ -298,6 +361,23 @@ function parseRegisterFamily(sheets: SheetRows[], roles: ReturnType<typeof detec
  */
 function ingestSheets(sheets: SheetRows[]): IngestResult {
     const roles = sheets.map((sheet) => detectSheetRole(sheet.rows));
+
+    // GOAL-8: a statement-only workbook is a standalone running-balance statement
+    // IFF its embedded account resolves to a statement-mode GL. Otherwise it keeps
+    // the register-completeness rule (INCOMPLETE_REGISTER_INPUT) — a lone MGR ledger
+    // extract still means "the register file is missing".
+    const statementOnly =
+        roles.includes('ledgerStatement') && !roles.includes('register') && !roles.includes('breakdown');
+    if (statementOnly) {
+        const statement = parseStatementFamily(sheets, roles);
+        const code = statementGlOf(statement.postings);
+        if (code && GL_CATALOG[code].mode === 'statement') {
+            return statement;
+        }
+        const { error } = resolveMode(roles); // the exact existing INCOMPLETE_REGISTER_INPUT message
+        return { mode: 'breakdown', ...emptyResult([error!]) };
+    }
+
     const { mode, error } = resolveMode(roles);
     if (error) {
         return { mode: 'breakdown', ...emptyResult([error]) };
@@ -331,7 +411,13 @@ export async function ingest(buffer: Buffer, options: IngestOptions = {}): Promi
     }
     const format = detectFormat(buffer, options.filename, options.format);
     if (format === 'csv') {
-        return { mode: 'breakdown', ...parseSheets([{ rows: rowsFromCsv(buffer) }]) };
+        // GOAL-8: route CSV through role detection too, so a statement-schema CSV
+        // (e.g. a sanitised single-sheet VAT file) reaches the statement path.
+        // A breakdown CSV still detects role 'breakdown' → byte-identical result.
+        // Keep the sheet NAMELESS (as the old `parseSheets([{ rows }])` call did) so
+        // breakdown-CSV postings keep `sheet: undefined` and sheetBalances keeps its
+        // '(sheet)' fallback label — no behaviour change for existing breakdown CSVs.
+        return ingestSheets([{ rows: rowsFromCsv(buffer) }]);
     }
     return ingestSheets(await sheetsFromXlsx(buffer));
 }

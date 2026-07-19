@@ -20,7 +20,7 @@ import { fmtBhd } from './export';
 
 /** Just the fields of an IngestResult this module needs (avoids a circular import). */
 export interface SheetBalanceInput {
-    mode: 'breakdown' | 'register';
+    mode: 'breakdown' | 'register' | 'statement';
     postings: ParsedPosting[];
     cheques?: RegisterCheque[];
     errors: ParseError[];
@@ -50,7 +50,9 @@ const ROLE_ORDER: Record<SheetRoleContribution, number> = { ledger: 0, breakdown
 
 export function computeSheetBalances(input: SheetBalanceInput): SheetBalance[] {
     const byName = new Map<string, Acc>();
-    const ledgerRole: SheetRoleContribution = input.mode === 'register' ? 'ledger' : 'breakdown';
+    // register AND statement sheets are ledger sheets (the statedEodFils capture
+    // below runs for role 'ledger'); only breakdown stays 'breakdown'.
+    const ledgerRole: SheetRoleContribution = input.mode === 'breakdown' ? 'breakdown' : 'ledger';
 
     const accFor = (sheet: string, role: SheetRoleContribution): Acc => {
         let acc = byName.get(sheet);

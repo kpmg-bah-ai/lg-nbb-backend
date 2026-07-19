@@ -158,4 +158,19 @@ describe('explainRun (GOAL-5 number provenance)', () => {
         expect(keys).toEqual(expect.arrayContaining(['glBalanceTotal', 'matched', 'outstandingNet', 'totalDifference', 'exceptions']));
         expect(figures.every((f) => f.basis && f.assessment)).toBe(true);
     });
+
+    it('explains a statement run: derived vs stated, gap, and the tie-out verdict', () => {
+        const figures = explainRun({
+            mode: 'statement',
+            summary: { dataRows: 3, parsed: 2, debitCount: 2, creditCount: 0, netFils: 1000, currencies: ['BHD'], branches: ['00001'] },
+            asOf: '2023-02-01',
+            balances: [{ entity: 'BH', gl: '8828010400010000', branchNumber: '00001', balanceFils: 1000, balance: 1, postingCount: 2 }],
+            sheetBalances: [{ sheet: 'VAT', role: 'ledger', parsedRows: 2, creditCount: 0, debitCount: 2, creditFils: 0, debitFils: 1000, netFils: 1000, statedEodFils: 1000, basis: 'x' }],
+            reconciliation: { asOf: '2023-02-01', toleranceFils: 1, balanced: true, totalAbsDifferenceFils: 0,
+                byBranch: [{ entity: 'BH', gl: '8828010400010000', branchNumber: '', glBalanceFils: 1000, outstandingNetFils: 0, outstandingCount: 0, oldCount: 0, oldFils: 0, currentCount: 0, currentFils: 0, differenceFils: 0, difference: 0, balanced: true, statedBalanceFils: 1000, derivedBalanceFils: 1000, extractGapFils: 0, classifiedFils: 0, residualFils: 0 }] },
+        });
+        const keys = figures.map(f => f.key);
+        expect(keys).toEqual(expect.arrayContaining(['derivedBalance', 'glBalance', 'extractGap']));
+        expect(figures.find(f => f.key === 'extractGap')!.flag).toBe(false); // ties out
+    });
 });

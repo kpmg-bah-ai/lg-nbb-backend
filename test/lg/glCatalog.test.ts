@@ -7,8 +7,10 @@ import {
 } from '../../src/shared/models';
 
 describe('GL catalog (GOAL-7 §1)', () => {
-    it('seeds exactly the two GLs with the right families', () => {
-        expect(Object.keys(GL_CATALOG).sort()).toEqual(['99801000', 'D2810085']);
+    it('seeds the register/breakdown GLs with the right families', () => {
+        expect(Object.keys(GL_CATALOG).sort()).toEqual(
+            ['8828010400010000', '8828010500010000', '99801000', 'D2810085']
+        );
         expect(GL_CATALOG['99801000'].mode).toBe('register');
         expect(GL_CATALOG['D2810085'].mode).toBe('breakdown');
     });
@@ -72,7 +74,37 @@ describe('GL catalog (GOAL-7 §1)', () => {
     });
 
     it('the type-level union matches the catalog keys', () => {
-        const codes: GlCode[] = ['99801000', 'D2810085'];
+        const codes: GlCode[] = ['99801000', 'D2810085', '8828010400010000', '8828010500010000'];
         expect(codes.every((c) => GL_CATALOG[c].code === c)).toBe(true);
+    });
+});
+
+describe('GOAL-8: VAT statement GLs', () => {
+    it('seeds the two VAT GLs as statement-mode logics', () => {
+        expect(Object.keys(GL_CATALOG).sort()).toEqual(
+            ['8828010400010000', '8828010500010000', '99801000', 'D2810085']
+        );
+        const input = GL_CATALOG['8828010400010000'];
+        const output = GL_CATALOG['8828010500010000'];
+        expect(input.mode).toBe('statement');
+        expect(output.mode).toBe('statement');
+        expect(input.matchModel).toBe('none');
+        expect(input.balanceModel).toBe('derivedEqualsStated');
+        expect(input.statement).toBe('runningBalance');
+        expect(input.branchNav).toBe('consolidated');
+        expect(input.requiredSheetRoles).toEqual(['ledgerStatement']);
+    });
+
+    it('resolves each VAT account (the Nostro/BGL Account) to its GL', () => {
+        expect(resolveGlCode('8828010400010000')).toBe('8828010400010000');
+        expect(resolveGlCode('8828010500010000')).toBe('8828010500010000');
+        // A different 16-digit account is unknown.
+        expect(resolveGlCode('8828010300010000')).toBeUndefined();
+    });
+
+    it('marks the VAT PII surface (Account Name / Teller / Detailed Description)', () => {
+        expect(GL_CATALOG['8828010400010000'].piiColumns).toEqual(
+            expect.arrayContaining(['Account Name', 'Teller', 'Detailed Description'])
+        );
     });
 });
